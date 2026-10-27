@@ -87,3 +87,6 @@ git log --oneline -1 # 确认提交信息
 | 版本 | 日期 | 说明 |
 |---|---|---|
 | v1.0.0 | 2026-10-27 | 首次开源发布：整理 client / server 源码，静态文件仅保留 `demo-hosts.html`，`server/setting/` 仅提供空白模板配置 `rtptyx_setting.template.json`，完成敏感信息脱敏与扫描；创建 Gitee 仓库 `dtnsman/ibbot-pty` 并推送初始提交 `09e226a` |
+| v1.0.0 | 2026-10-27 | 补充上传说明文档 `gitee代码上传说明.md`，提交 `61f8c6f` |
+| v1.0.0 | 2026-10-27 | 开源协议由 MIT 切换为 GPLv3，同步更新 LICENSE、README、开源说明、`client/package.json` 与 rollup 构建 banner，提交 `1f7e176` |
+| v1.0.0 | 2026-10-27 | 同步发布到 GitHub：https://github.com/dtnsman/ibbot-pty ，Gitee 作为主仓库保留 |

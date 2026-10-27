@@ -72,3 +72,14 @@ npm run build     # 重新构建 dist
 [GNU General Public License v3.0](LICENSE)（GPLv3）
 
 本项目采用 GPLv3 开源协议发布，任何再分发或修改后的作品都必须以相同协议开源，并保留完整的版权声明。
+
+## 仓库地址
+
+- Gitee：https://gitee.com/dtnsman/ibbot-pty
+- GitHub：https://github.com/dtnsman/ibbot-pty
+
+### 发布纪录
+
+| 版本 | 日期 | 说明 |
+|---|---|---|
+| v1.0.0 | 2026-10-27 | 首次开源发布并同步至 Gitee 与 GitHub；许可证为 GPLv3 |
