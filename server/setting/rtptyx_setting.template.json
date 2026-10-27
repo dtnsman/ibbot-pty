@@ -1,9 +1,24 @@
-﻿{
+{
   "port": 10310,
   "closed": false,
   "secret_key": "",
+
   "max_terminals": 50,
-  "idle_timeout": 0,
+  "idle_timeout_ms": 1800000,
+  "buffer_size": 65536,
+
+  "backend": "local",
+
+  "tunnel": {
+    "enabled": false,
+    "serverUrl": "",
+    "domainPrefix": "",
+    "domainSuffix": "",
+    "serverId": "",
+    "localHost": "127.0.0.1",
+    "localPort": 0
+  },
+
   "ssh": {
     "enabled": false,
     "host": "",
@@ -11,15 +26,16 @@
     "user": "",
     "auth": {
       "type": "key",
-      "privateKeyPath": ""
+      "privateKeyPath": "",
+      "password": ""
     },
     "strictHostKeyChecking": true,
-    "knownHostsPath": ""
+    "knownHostsPath": "",
+    "allowedShells": ["bash", "zsh", "fish", "sh"]
   },
-  "tunnel": {
-    "enabled": false,
-    "server": "",
-    "token": "",
-    "name": ""
+
+  "local": {
+    "enabled": true,
+    "allowedShells": ["powershell", "pwsh", "cmd", "bash", "zsh", "fish", "sh"]
   }
 }
