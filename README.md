@@ -1,4 +1,4 @@
-﻿# IBBot PTY Manager
+# IBBot PTY Manager
 
 基于 WebSocket 的远程 PTY（伪终端）管理套件，支持多主机、多终端、文件传输与 SSH 隧道穿透。
 
@@ -69,4 +69,6 @@ npm run build     # 重新构建 dist
 
 ## 许可证
 
-[MIT](LICENSE)
+[GNU General Public License v3.0](LICENSE)（GPLv3）
+
+本项目采用 GPLv3 开源协议发布，任何再分发或修改后的作品都必须以相同协议开源，并保留完整的版权声明。

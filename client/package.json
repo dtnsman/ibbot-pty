@@ -1,7 +1,7 @@
 {
   "name": "ibbot-pty-sdk",
   "version": "1.0.0",
-  "description": "IBBot Remote PTY SDK — WebSocket client for browser & node.js",
+  "description": "IBBot Remote PTY SDK 鈥?WebSocket client for browser & node.js",
   "main": "dist/ibbot-pty.cjs.js",
   "module": "dist/ibbot-pty.esm.js",
   "browser": "dist/ibbot-pty.umd.js",
@@ -13,7 +13,7 @@
     "prepublishOnly": "npm run build"
   },
   "keywords": ["pty", "terminal", "websocket", "ssh", "xterm", "ibbot"],
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "dependencies": {
     "ws": "^8.16.0"
   },

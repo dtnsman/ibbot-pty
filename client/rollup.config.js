@@ -4,10 +4,10 @@ import terser from '@rollup/plugin-terser';
 
 const input = 'src/index.js';
 const name = 'IBotPty';
-const banner = `/*! ibbot-pty-sdk v1.0.0 | MIT License */`;
+const banner = `/*! ibbot-pty-sdk v1.0.0 | GPL-3.0-only License */`;
 
 export default [
-  // UMD（浏览器 <script> 直接用）
+  // UMD锛堟祻瑙堝櫒 <script> 鐩存帴鐢級
   {
     input,
     output: {
@@ -44,7 +44,7 @@ export default [
     external: ['ws'],
     plugins: [resolve({ preferBuiltins: false }), commonjs()]
   },
-  // CJS（Node）
+  // CJS锛圢ode锛?
   {
     input,
     output: {
