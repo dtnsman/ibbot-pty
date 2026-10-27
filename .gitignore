@@ -1,0 +1,13 @@
+﻿node_modules/
+*.log
+.DS_Store
+Thumbs.db
+
+# 本地运行时配置（从模板复制后自行填写，切勿提交）
+server/setting/rtptyx_setting.json
+server/setting/server-id
+server/setting/*.local.json
+
+# 构建/临时产物
+dist/*.map
+tmp/

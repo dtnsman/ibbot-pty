@@ -1,0 +1,14 @@
+{
+  "name": "ibbot-pty-server",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test:tunnel": "node test/test-tunnel.js"
+  },
+  "dependencies": {
+    "iconv-lite": "^0.7.3",
+    "node-pty": "^1.0.0",
+    "ws": "^8.16.0"
+  }
+}

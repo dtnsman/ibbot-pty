@@ -1,0 +1,1525 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>IBBot PTY Manager (多主机 + 多终端 + 文件/文件夹上传 + 执行命令)</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+  <script src="./dist/ibbot-pty.umd.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Arial, sans-serif; background: #1e1e1e; color: #eee; overflow: hidden; }
+
+    #toolbar {
+      padding: 8px 12px; background: #252526;
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    }
+    #toolbar select, #toolbar button { padding: 4px 8px; font-size: 13px; }
+    #status {
+      margin-left: auto; font-size: 12px; color: #8f8;
+      min-width: 220px; text-align: right;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .badge {
+      display: inline-block; padding: 1px 6px; border-radius: 8px;
+      font-size: 11px; background: #444; color: #ccc; margin-left: 4px;
+    }
+    .badge.ok { background: #2ecc71; color: #000; }
+    .badge.err { background: #e74c3c; color: #fff; }
+
+    /* ============================================================
+       标签栏：左侧为可滚动的终端标签区，右侧为固定的 + 号按钮
+       ============================================================ */
+    #terminalTabs {
+      display: flex;
+      background: #252526;
+      border-bottom: 1px solid #333;
+      height: 36px;
+      align-items: stretch;
+      position: relative;
+    }
+
+    #terminalTabsScroll {
+      flex: 1;
+      display: flex;
+      overflow-x: auto;
+      overflow-y: hidden;
+      white-space: nowrap;
+      align-items: stretch;
+      scrollbar-width: thin;
+    }
+    #terminalTabsScroll::-webkit-scrollbar { height: 4px; }
+    #terminalTabsScroll::-webkit-scrollbar-thumb { background: #444; border-radius: 2px; }
+
+    .terminal-tab {
+      display: flex; align-items: center;
+      padding: 0 10px 0 14px;
+      color: #ccc; cursor: pointer;
+      border-right: 1px solid #333;
+      font-size: 13px; user-select: none;
+      flex-shrink: 0;
+      position: relative;
+      transition: background 0.15s;
+    }
+    .terminal-tab:hover { background: #2d2d2d; }
+    .terminal-tab.active {
+      background: #1e1e1e; color: #fff;
+    }
+    .terminal-tab.active::after {
+      content: '';
+      position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+      background: #2ecc71;
+    }
+    .terminal-tab .title { margin-right: 8px; }
+    .terminal-tab .close-tab {
+      color: #999; font-size: 14px; line-height: 1;
+      padding: 0 3px; border-radius: 3px;
+      transition: all 0.15s;
+    }
+    .terminal-tab .close-tab:hover { color: #fff; background: #555; }
+    .terminal-tab.exited .title { color: #888; font-style: italic; }
+
+    #btnNewTab {
+      flex-shrink: 0;
+      width: 40px;
+      display: flex; align-items: center; justify-content: center;
+      color: #8f8;
+      font-size: 20px;
+      font-weight: 300;
+      cursor: pointer;
+      user-select: none;
+      background: #2a2a2a;
+      border-left: 1px solid #333;
+      transition: all 0.15s;
+    }
+    #btnNewTab:hover {
+      background: #3a3a3a;
+      color: #afa;
+      transform: scale(1.08);
+    }
+    #btnNewTab:active {
+      transform: scale(0.95);
+    }
+    #btnNewTab.disabled {
+      color: #555; cursor: not-allowed; background: #252526;
+    }
+    #btnNewTab.disabled:hover { transform: none; }
+
+    #terminalTabs.empty #btnNewTab { color: #8f8; }
+
+    #terminalContainer {
+      position: relative; width: 100vw;
+      height: calc(100vh - 45px - 36px);
+    }
+    .term-pane { position: absolute; inset: 0; display: none; }
+    .term-pane.active { display: block; }
+    .empty-hint {
+      display: flex; align-items: center; justify-content: center;
+      height: 100%; color: #666; font-size: 14px;
+    }
+
+    .modal {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.7); z-index: 100;
+      justify-content: center; align-items: center;
+    }
+    .modal .box {
+      background: #2c3e50; padding: 20px; border-radius: 8px;
+      min-width: 380px; max-width: 90vw;
+    }
+    .modal h3 { margin: 0 0 12px 0; color: #fff; }
+    .modal label { display: block; font-size: 13px; color: #bdc3c7; margin: 8px 0 4px; }
+    .modal input, .modal select, .modal textarea {
+      width: 100%; padding: 6px; font-size: 13px;
+      background: #1e1e1e; color: #eee; border: 1px solid #444;
+      border-radius: 4px;
+    }
+    .modal textarea {
+      font-family: Consolas, "Courier New", monospace;
+      resize: vertical;
+    }
+    .modal .actions {
+      display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px;
+    }
+    .modal .actions button { padding: 6px 12px; }
+
+    /* 编辑区标题行：左侧标题 + 右侧粘贴导入按钮 */
+    .edit-section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+    .edit-section-head .head-title {
+      font-size: 13px;
+      color: #bdc3c7;
+    }
+
+    .host-list { max-height: 50vh; overflow: auto; margin: 8px 0; }
+    .host-item {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px; border-bottom: 1px solid #34495e;
+      font-size: 13px;
+    }
+    .host-item .info { flex: 1; overflow: hidden; }
+    .host-item .info .name { font-weight: bold; }
+    .host-item .info .url {
+      color: #95a5a6; font-size: 12px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .host-item button { padding: 3px 8px; font-size: 12px; }
+
+    #filePanel {
+      display: none; position: fixed; right: 12px; top: 60px;
+      width: 480px; max-height: 70vh; overflow: auto;
+      background: #252526; border: 1px solid #444;
+      border-radius: 6px; padding: 10px;
+      z-index: 50; box-shadow: 0 6px 20px rgba(0,0,0,0.5);
+    }
+    #filePanel .head {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 8px; border-bottom: 1px solid #333; padding-bottom: 6px;
+    }
+    #filePanel .head b { font-size: 14px; }
+    .file-row {
+      display: flex; align-items: center; gap: 6px;
+      padding: 6px 0; border-bottom: 1px solid #2a2a2a; font-size: 13px;
+    }
+    .file-row .name {
+      flex: 1;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-family: Consolas, "Courier New", monospace;
+    }
+    .file-row .size { color: #888; font-size: 12px; }
+    .file-row button { padding: 2px 8px; font-size: 12px; }
+    .file-row button.rm { background: #c0392b; }
+    .file-row button.rm:hover { background: #a93226; }
+
+    body.dragging { outline: 2px dashed #4af; outline-offset: -4px; }
+
+    #execResult {
+      max-height: 40vh; overflow: auto;
+      background: #1e1e1e; color: #eee;
+      padding: 10px; border-radius: 4px;
+      font-size: 12px; line-height: 1.5;
+      white-space: pre-wrap; word-break: break-all;
+      font-family: Consolas, "Courier New", monospace;
+      margin: 0;
+    }
+
+    /* 粘贴导入模态框中的 textarea */
+    #pasteImportArea {
+      min-height: 220px;
+      font-size: 12px;
+      line-height: 1.5;
+      tab-size: 2;
+    }
+  </style>
+</head>
+<body>
+
+<div id="toolbar">
+  <button id="btnManageHosts">🖥️ 设备管理</button>
+  <select id="selHost"></select>
+  <span id="hostStatus" class="badge">未连接</span>
+
+  <select id="selBackend"></select>
+  <select id="selShell"></select>
+  <button id="btnNew">新建终端</button>
+  <button id="btnClose">关闭当前终端</button>
+  <button id="btnList">列出终端</button>
+  <button id="btnExec" style="background:#8e44ad;">▶️ 执行命令</button>
+  <button id="btnUpload">上传文件</button>
+  <button id="btnUploadDir">上传文件夹</button>
+  <button id="btnFiles">文件列表</button>
+  <input type="file" id="fileInput" multiple style="display:none">
+  <input type="file" id="dirInput" webkitdirectory directory multiple style="display:none">
+  <span id="status">就绪</span>
+</div>
+
+<div id="terminalTabs">
+  <div id="terminalTabsScroll"></div>
+  <div id="btnNewTab" title="新建终端">＋</div>
+</div>
+
+<div id="terminalContainer">
+  <div class="empty-hint" id="emptyHint">选择主机后点击「新建终端」开始</div>
+</div>
+
+<div id="filePanel">
+  <div class="head">
+    <b>服务端文件</b>
+    <div>
+      <button id="btnRefreshFiles" style="padding:2px 8px;">刷新</button>
+      <button id="btnCloseFilePanel" style="padding:2px 8px;">×</button>
+    </div>
+  </div>
+  <div id="fileListBody"></div>
+</div>
+
+<div class="modal" id="hostsModal">
+  <div class="box" style="min-width:520px;">
+    <h3>设备管理</h3>
+    <div style="display: flex; gap: 8px; justify-content: flex-end; margin-bottom: 8px;">
+      <button id="btnExportHosts" style="background:#2980b9;">📤 导出配置</button>
+      <button id="btnImportHosts" style="background:#27ae60;">📥 导入配置</button>
+      <input type="file" id="importHostsInput" accept=".json,application/json" style="display:none">
+    </div>
+    <div id="hostList" class="host-list"></div>
+    <div style="border-top:1px solid #34495e; padding-top:10px;">
+      <!-- 标题行：左侧标题 + 右侧粘贴导入按钮 -->
+      <div class="edit-section-head">
+        <span class="head-title">添加 / 编辑设备</span>
+        <button id="btnPasteImport" style="padding:3px 10px; font-size:12px; background:#16a085;">📋 粘贴导入</button>
+      </div>
+      <label>名称</label>
+      <input id="hName" placeholder="例如：内网 Linux-01">
+      <label>WebSocket 地址</label>
+      <input id="hUrl" placeholder="ws://192.168.1.10:8080 或 ws://domain/path">
+      <label>访问密码（留空表示无密码）</label>
+      <input id="hSecret" type="password" placeholder="secret_key">
+      <div class="actions">
+        <button id="btnHostCancel">关闭</button>
+        <button id="btnHostSave" style="background:#27ae60;">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 粘贴导入模态框 -->
+<div class="modal" id="pasteImportModal">
+  <div class="box" style="min-width:600px; max-width:90vw;">
+    <h3>📋 粘贴导入设备配置</h3>
+    <div style="font-size:12px; color:#95a5a6; margin-bottom:8px; line-height:1.6;">
+      粘贴 JSON 数组格式的设备配置（与导出的 JSON 文件结构一致）。<br>
+      示例：<code style="color:#8f8;">[{"id":"h-xxx","name":"主机1","url":"ws://...","secretKey":null}, ...]</code>
+    </div>
+    <label>JSON 内容</label>
+    <textarea id="pasteImportArea" placeholder='[
+  {
+    "id": "h-abc123",
+    "name": "内网 Linux-01",
+    "url": "ws://192.168.1.10:8080",
+    "secretKey": null
+  }
+]'></textarea>
+    <div id="pasteImportError" style="display:none; color:#e74c3c; font-size:12px; margin-top:6px;"></div>
+    <div class="actions">
+      <button id="btnPasteImportCancel">取消</button>
+      <button id="btnPasteImportOk" style="background:#27ae60;">导入</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="passwordModal">
+  <div class="box" style="min-width:340px;">
+    <h3>需要访问密码</h3>
+    <div style="font-size:13px; color:#bdc3c7; margin-bottom:6px;">
+      主机：<span id="pwdHostName"></span>
+    </div>
+    <input type="password" id="pwdInput" placeholder="请输入密码">
+    <div class="actions">
+      <button id="btnPwdCancel">取消</button>
+      <button id="btnPwdOk" style="background:#27ae60;">连接</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="execModal">
+  <div class="box" style="min-width:640px;">
+    <h3>执行命令</h3>
+    <label>命令（Ctrl+Enter 快速执行）</label>
+    <textarea id="execCmd" rows="4"
+      placeholder="例如：cd /data &amp;&amp; ls -all &amp;&amp; crontab -l"></textarea>
+
+    <div style="display:flex; gap:10px; margin-top:10px; font-size:13px; align-items:center; flex-wrap:wrap;">
+      <label style="margin:0; color:#bdc3c7;">执行方式:</label>
+      <select id="execMode" style="width:auto; padding:4px;">
+        <option value="local">本地 shell</option>
+        <option value="ssh">SSH</option>
+      </select>
+      <label style="margin:0; color:#bdc3c7;">超时(ms):</label>
+      <input id="execTimeout" type="number" value="60000" style="width:110px; padding:4px;">
+    </div>
+
+    <div class="actions">
+      <button id="btnExecCancel">取消</button>
+      <button id="btnExecRun" style="background:#27ae60;">执行</button>
+    </div>
+
+    <div id="execResultWrap" style="display:none; margin-top:12px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+        <b style="font-size:13px;">执行结果</b>
+        <span id="execExit" class="badge">exitCode: -</span>
+      </div>
+      <pre id="execResult"></pre>
+    </div>
+  </div>
+</div>
+
+<script>
+(async () => {
+  const $ = id => document.getElementById(id);
+
+  function setStatus(text) { $('status').textContent = text; }
+
+  function formatSize(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(2) + ' MB';
+    return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+
+  function genId() {
+    return 'h-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+  }
+
+  const LS_KEY = 'ibbot_pty_hosts_v1';
+
+  function loadHosts() {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (raw) return JSON.parse(raw);
+    } catch (e) { console.warn('loadHosts error:', e); }
+    return [];
+  }
+
+  function saveHosts(hosts) {
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify(hosts));
+    } catch (e) { console.warn('saveHosts error:', e); }
+  }
+
+  let hosts = loadHosts();
+
+  const runtime = new Map();
+
+  function getRt(hostId) { return runtime.get(hostId) || null; }
+  function getActiveHostId() { return $('selHost').value; }
+  function getActiveRt() { return getRt(getActiveHostId()); }
+
+  async function ensureConnected(hostId) {
+    const host = hosts.find(h => h.id === hostId);
+    if (!host) throw new Error('host not found: ' + hostId);
+
+    let rt = runtime.get(hostId);
+    if (rt && rt.connected && rt.client && rt.client.connected) return rt;
+    if (rt && rt.connectPromise) return rt.connectPromise;
+
+    if (!rt) {
+      rt = {
+        host,
+        client: null,
+        connected: false,
+        terminals: new Map(),
+        activeTermId: null,
+        backends: [], defBackend: null, shells: [],
+        connectPromise: null
+      };
+      runtime.set(hostId, rt);
+    }
+
+    rt.connectPromise = (async () => {
+      const client = new IBotPty.PtyClient({
+        url: host.url,
+        secretKey: host.secretKey || null,
+        autoReconnect: true,
+        reconnectInterval: 2000,
+        maxReconnectAttempts: 10
+      });
+      rt.client = client;
+
+      client.on('error', e => console.error(`[${host.name}] client error:`, e));
+      client.on('reconnecting', ({ attempt, delay }) => {
+        if (getActiveHostId() === hostId) {
+          setStatus(`[${host.name}] 重连中 (${attempt})，${delay}ms 后...`);
+        }
+      });
+      client.on('reconnected', () => {
+        if (getActiveHostId() === hostId) setStatus(`[${host.name}] 已重连`);
+      });
+
+      await client.connect();
+
+      let needPwd = false;
+      try { needPwd = await client.checkPasswordRequired(); } catch {}
+
+      if (needPwd) {
+        const pwd = await askPassword(host.name);
+        if (pwd == null) throw new Error('用户取消密码输入');
+        client.setSecretKey(pwd);
+        host.secretKey = pwd;
+        saveHosts(hosts);
+      }
+
+      try {
+        const r1 = await client.listBackends();
+        rt.backends = r1.backends;
+        rt.defBackend = r1.default;
+        const r2 = await client.listShells();
+        rt.shells = r2.shells;
+      } catch (e) { console.warn(`[${host.name}] listBackends/listShells error:`, e); }
+
+      rt.connected = true;
+      rt.connectPromise = null;
+
+      if (getActiveHostId() === hostId) {
+        refreshBackendSelectors(rt);
+        setHostStatus('已连接', 'ok');
+      }
+      return rt;
+    })();
+
+    try {
+      return await rt.connectPromise;
+    } catch (e) {
+      rt.connectPromise = null;
+      throw e;
+    }
+  }
+
+  function askPassword(hostName) {
+    return new Promise(resolve => {
+      $('pwdHostName').textContent = hostName;
+      $('pwdInput').value = '';
+      $('passwordModal').style.display = 'flex';
+      $('pwdInput').focus();
+
+      const cleanup = () => {
+        $('btnPwdOk').onclick = null;
+        $('btnPwdCancel').onclick = null;
+        $('passwordModal').style.display = 'none';
+      };
+      $('btnPwdOk').onclick = () => {
+        const v = $('pwdInput').value.trim();
+        if (!v) { $('pwdInput').focus(); return; }
+        cleanup();
+        resolve(v);
+      };
+      $('btnPwdCancel').onclick = () => {
+        cleanup();
+        resolve(null);
+      };
+    });
+  }
+
+  function setHostStatus(text, cls) {
+    const el = $('hostStatus');
+    el.textContent = text;
+    el.className = 'badge' + (cls ? ' ' + cls : '');
+  }
+
+  function refreshHostSelect() {
+    const sel = $('selHost');
+    const prev = sel.value;
+    sel.innerHTML = '';
+
+    if (!hosts.length) {
+      const o = document.createElement('option');
+      o.value = ''; o.textContent = '（未配置主机）';
+      sel.appendChild(o);
+      onHostChange();
+      return;
+    }
+
+    hosts.forEach(h => {
+      const o = document.createElement('option');
+      o.value = h.id;
+      o.textContent = h.name || h.url;
+      sel.appendChild(o);
+    });
+    if (prev && hosts.some(h => h.id === prev)) sel.value = prev;
+    onHostChange();
+  }
+
+  const tabsScrollEl = $('terminalTabsScroll');
+  const btnNewTabEl = $('btnNewTab');
+  const containerEl = $('terminalContainer');
+
+  async function onHostChange() {
+    const hostId = getActiveHostId();
+    tabsScrollEl.innerHTML = '';
+    containerEl.innerHTML = '';
+    const hint = document.createElement('div');
+    hint.className = 'empty-hint';
+    hint.id = 'emptyHint';
+    hint.textContent = '点击「新建终端」开始';
+    containerEl.appendChild(hint);
+
+    if (!hostId) {
+      setHostStatus('无主机', 'err');
+      $('selBackend').innerHTML = '';
+      $('selShell').innerHTML = '';
+      updateNewTabState();
+      return;
+    }
+
+    const rt = getRt(hostId);
+    if (!rt) {
+      setHostStatus('未连接', '');
+      $('selBackend').innerHTML = '';
+      $('selShell').innerHTML = '';
+      updateNewTabState();
+      return;
+    }
+
+    rt.terminals.forEach(obj => {
+      containerEl.appendChild(obj.paneEl);
+      tabsScrollEl.appendChild(obj.tabEl);
+    });
+    updateActiveTab(rt);
+    updateEmptyHint(rt);
+
+    refreshBackendSelectors(rt);
+    if (rt.connected) setHostStatus('已连接', 'ok');
+    else setHostStatus('未连接', '');
+    updateNewTabState();
+
+    if (rt.activeTermId) {
+      const obj = rt.terminals.get(rt.activeTermId);
+      if (obj) setTimeout(() => { try { obj.fitAddon.fit(); } catch {} }, 30);
+    }
+  }
+
+  $('selHost').onchange = onHostChange;
+
+  function refreshBackendSelectors(rt) {
+    const selBackend = $('selBackend');
+    selBackend.innerHTML = '';
+    (rt.backends || []).forEach(b => {
+      const o = document.createElement('option');
+      o.value = b; o.textContent = b;
+      if (b === rt.defBackend) o.selected = true;
+      selBackend.appendChild(o);
+    });
+    refreshShells(rt);
+  }
+
+  function refreshShells(rt) {
+    const selShell = $('selShell');
+    const b = $('selBackend').value;
+    selShell.innerHTML = '';
+    (rt.shells || []).filter(s => s.backend === b).forEach(s => {
+      const o = document.createElement('option');
+      o.value = s.id;
+      o.textContent = `${s.id}${s.path ? ' (' + s.path + ')' : ''}`;
+      selShell.appendChild(o);
+    });
+  }
+
+  $('selBackend').onchange = () => {
+    const rt = getActiveRt();
+    if (rt) refreshShells(rt);
+  };
+
+  function updateNewTabState() {
+    const rt = getActiveRt();
+    if (rt && rt.connected) {
+      btnNewTabEl.classList.remove('disabled');
+      btnNewTabEl.title = '新建终端';
+    } else {
+      btnNewTabEl.classList.add('disabled');
+      btnNewTabEl.title = '请先连接主机';
+    }
+  }
+
+  async function createTerm() {
+    const hostId = getActiveHostId();
+    if (!hostId) { setStatus('请先配置主机'); return; }
+
+    let rt;
+    try {
+      setStatus('连接主机...');
+      rt = await ensureConnected(hostId);
+    } catch (e) {
+      setStatus(`连接失败: ${e.message}`);
+      return;
+    }
+
+    updateNewTabState();
+
+    const backend = $('selBackend').value;
+    const shell = $('selShell').value;
+    const opts = { cols: 80, rows: 24, backend };
+    if (backend === 'local') opts.shellId = shell;
+    else opts.remoteShell = shell;
+
+    let term;
+    try {
+      term = await rt.client.createTerminal(opts);
+    } catch (e) {
+      setStatus(`创建失败: ${e.message}`);
+      return;
+    }
+
+    if (rt.terminals.has(term.termId)) {
+      switchTerm(rt, term.termId);
+      return;
+    }
+
+    const paneEl = document.createElement('div');
+    paneEl.className = 'term-pane';
+    containerEl.appendChild(paneEl);
+
+    const xterm = new Terminal({
+      cursorBlink: true,
+      fontSize: 14,
+      fontFamily: 'Consolas, "Courier New", monospace',
+      theme: { background: '#1e1e1e', foreground: '#ffffff' }
+    });
+    const fitAddon = new FitAddon.FitAddon();
+    xterm.loadAddon(fitAddon);
+    xterm.open(paneEl);
+
+    const obj = {
+      termId: term.termId,
+      term,
+      xterm,
+      fitAddon,
+      paneEl,
+      tabEl: null,
+      disposers: [],
+      exited: false
+    };
+    rt.terminals.set(term.termId, obj);
+
+    term.attachXterm(xterm, { autoResize: false });
+
+    const dOnResize = xterm.onResize(({ cols, rows }) => {
+      term.resize(cols, rows).catch(() => {});
+    });
+    obj.disposers.push(() => dOnResize.dispose && dOnResize.dispose());
+
+    term.onExit(({ code, error }) => {
+      obj.exited = true;
+      const msg = error
+        ? `\r\n[会话错误] ${error}\r\n`
+        : `\r\n[会话结束] code=${code}\r\n`;
+      try { xterm.write(msg); } catch {}
+      if (obj.tabEl) obj.tabEl.classList.add('exited');
+    });
+
+    addTab(rt, obj);
+    switchTerm(rt, term.termId);
+    setTimeout(() => {
+      try { fitAddon.fit(); } catch {}
+      term.resize(xterm.cols, xterm.rows).catch(() => {});
+      xterm.focus();
+    }, 50);
+
+    updateEmptyHint(rt);
+    setStatus(`[${rt.host.name}] 终端数: ${rt.terminals.size}`);
+    updateNewTabState();
+  }
+
+  function addTab(rt, obj) {
+    if (obj.tabEl) return;
+    const tab = document.createElement('div');
+    tab.className = 'terminal-tab';
+    tab.dataset.termId = obj.termId;
+
+    // 取 termId 的尾 3 位作为短标识
+    const shortId = obj.termId.slice(-3);
+    tab.innerHTML = `<span class="title" title="${escapeHtml(obj.termId)}">终端 ${escapeHtml(shortId)}</span><span class="close-tab">×</span>`;
+
+    tab.addEventListener('click', (e) => {
+      if (e.target.classList.contains('close-tab')) {
+        e.stopPropagation();
+        closeTerm(rt, obj.termId);
+      } else {
+        switchTerm(rt, obj.termId);
+      }
+    });
+
+    tabsScrollEl.appendChild(tab);
+    obj.tabEl = tab;
+
+    requestAnimationFrame(() => {
+      tab.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'end' });
+    });
+  }
+
+  function removeTab(obj) {
+    if (obj.tabEl) { obj.tabEl.remove(); obj.tabEl = null; }
+  }
+
+  function updateActiveTab(rt) {
+    rt.terminals.forEach(obj => {
+      if (obj.tabEl) obj.tabEl.classList.toggle('active', obj.termId === rt.activeTermId);
+      obj.paneEl.classList.toggle('active', obj.termId === rt.activeTermId);
+    });
+  }
+
+  function updateEmptyHint(rt) {
+    const hint = containerEl.querySelector('.empty-hint');
+    if (hint) hint.style.display = rt.terminals.size === 0 ? 'flex' : 'none';
+  }
+
+  function switchTerm(rt, termId) {
+    if (!rt.terminals.has(termId)) return;
+    rt.activeTermId = termId;
+    updateActiveTab(rt);
+    const obj = rt.terminals.get(termId);
+    if (obj.tabEl) {
+      obj.tabEl.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
+    }
+    setTimeout(() => {
+      try { obj.fitAddon.fit(); } catch {}
+      obj.term.resize(obj.xterm.cols, obj.xterm.rows).catch(() => {});
+      obj.xterm.focus();
+    }, 30);
+  }
+
+  async function closeTerm(rt, termId) {
+    const obj = rt.terminals.get(termId);
+    if (!obj) return;
+
+    obj.disposers.forEach(fn => { try { fn(); } catch {} });
+    obj.disposers = [];
+    try { obj.term.detach && obj.term.detach(); } catch {}
+    try { obj.xterm.dispose(); } catch {}
+    obj.paneEl.remove();
+    removeTab(obj);
+    rt.terminals.delete(termId);
+
+    try { await rt.client.destroy(termId); } catch (e) { console.warn('destroy failed:', e); }
+
+    if (rt.activeTermId === termId) {
+      const next = rt.terminals.keys().next();
+      if (!next.done) {
+        switchTerm(rt, next.value);
+      } else {
+        rt.activeTermId = null;
+        updateActiveTab(rt);
+      }
+    }
+    updateEmptyHint(rt);
+    setStatus(`[${rt.host.name}] 终端数: ${rt.terminals.size}`);
+  }
+
+  $('btnNew').onclick = createTerm;
+
+  btnNewTabEl.onclick = () => {
+    if (btnNewTabEl.classList.contains('disabled')) {
+      setStatus('请先连接主机');
+      return;
+    }
+    createTerm();
+  };
+
+  $('btnClose').onclick = () => {
+    const rt = getActiveRt();
+    if (rt && rt.activeTermId) closeTerm(rt, rt.activeTermId);
+  };
+
+  $('btnList').onclick = async () => {
+    const rt = getActiveRt();
+    if (!rt || !rt.connected) { setStatus('未连接'); return; }
+    try {
+      const list = await rt.client.listTerminals();
+      console.log(`[${rt.host.name}] 终端列表:`, list);
+      const obj = rt.terminals.get(rt.activeTermId);
+      if (obj) {
+        obj.xterm.write(
+          '\r\n=== 服务端终端列表 ===\r\n' +
+          list.map(t => `${t.termId}  backend=${t.backend}  pid=${t.pid}`).join('\r\n') +
+          '\r\n'
+        );
+      }
+    } catch (e) { console.warn(e); }
+  };
+
+  let editingHostId = null;
+
+  $('btnManageHosts').onclick = () => {
+    editingHostId = null;
+    $('hName').value = '';
+    $('hUrl').value = '';
+    $('hSecret').value = '';
+    renderHostList();
+    $('hostsModal').style.display = 'flex';
+  };
+
+  $('btnHostCancel').onclick = () => {
+    $('hostsModal').style.display = 'none';
+  };
+
+  $('btnHostSave').onclick = () => {
+    const name = $('hName').value.trim();
+    const url = $('hUrl').value.trim();
+    const secretKey = $('hSecret').value.trim();
+
+    if (!name || !url) { alert('名称和地址必填'); return; }
+
+    if (editingHostId) {
+      const h = hosts.find(x => x.id === editingHostId);
+      if (h) {
+        const urlChanged = h.url !== url;
+        h.name = name; h.url = url;
+        if (secretKey !== '' || h.secretKey) h.secretKey = secretKey || null;
+        if (urlChanged) {
+          const rt = runtime.get(h.id);
+          if (rt && rt.client) {
+            try { rt.client.disconnect(); } catch {}
+          }
+          runtime.delete(h.id);
+        }
+      }
+      editingHostId = null;
+    } else {
+      hosts.push({ id: genId(), name, url, secretKey: secretKey || null });
+    }
+
+    saveHosts(hosts);
+    renderHostList();
+    refreshHostSelect();
+
+    $('hName').value = '';
+    $('hUrl').value = '';
+    $('hSecret').value = '';
+  };
+
+  // ============================================================
+  // 导出 / 导入 JSON 配置文件
+  // ============================================================
+  $('btnExportHosts').onclick = () => {
+    if (!hosts.length) {
+      alert('当前没有可导出的设备配置');
+      return;
+    }
+    try {
+      const data = JSON.stringify(hosts, null, 2);
+      const blob = new Blob([data], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ibbot-pty-hosts-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setStatus(`✅ 已导出 ${hosts.length} 个设备配置`);
+    } catch (e) {
+      alert('导出失败: ' + e.message);
+    }
+  };
+
+  $('btnImportHosts').onclick = () => {
+    $('importHostsInput').click();
+  };
+
+  $('importHostsInput').onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    e.target.value = '';
+
+    try {
+      const text = await file.text();
+      const imported = JSON.parse(text);
+
+      if (!Array.isArray(imported)) {
+        alert('导入失败：JSON 根节点必须是数组');
+        return;
+      }
+
+      const valid = imported.every(item =>
+        item && typeof item === 'object' &&
+        typeof item.id === 'string' && item.id.trim() !== '' &&
+        typeof item.name === 'string' && item.name.trim() !== '' &&
+        typeof item.url === 'string' && item.url.trim() !== ''
+      );
+
+      if (!valid) {
+        alert('导入失败：部分配置项缺少 id / name / url 字段');
+        return;
+      }
+
+      const existingMap = new Map(hosts.map(h => [h.id, h]));
+      for (const item of imported) {
+        const host = {
+          id: item.id,
+          name: item.name,
+          url: item.url,
+          secretKey: item.secretKey || null
+        };
+        existingMap.set(host.id, host);
+      }
+
+      hosts = Array.from(existingMap.values());
+      saveHosts(hosts);
+
+      const activeId = getActiveHostId();
+      if (activeId) {
+        const importedActive = imported.find(h => h.id === activeId);
+        if (importedActive) {
+          const rt = runtime.get(activeId);
+          if (rt && rt.client) {
+            try { rt.client.disconnect(); } catch {}
+            runtime.delete(activeId);
+          }
+        }
+      }
+
+      renderHostList();
+      refreshHostSelect();
+      setStatus(`✅ 已导入 ${imported.length} 个设备配置，当前共 ${hosts.length} 个`);
+
+    } catch (err) {
+      alert('导入失败：无法解析 JSON 文件\n' + err.message);
+    }
+  };
+
+  // ============================================================
+  // 新增：粘贴导入
+  // ============================================================
+  const pasteImportModal = $('pasteImportModal');
+  const pasteImportArea = $('pasteImportArea');
+  const pasteImportError = $('pasteImportError');
+
+  $('btnPasteImport').onclick = () => {
+    pasteImportArea.value = '';
+    pasteImportError.style.display = 'none';
+    pasteImportError.textContent = '';
+    pasteImportModal.style.display = 'flex';
+    setTimeout(() => pasteImportArea.focus(), 50);
+  };
+
+  $('btnPasteImportCancel').onclick = () => {
+    pasteImportModal.style.display = 'none';
+  };
+
+  /**
+   * 统一的导入逻辑：接收解析后的数组，合并到 hosts
+   * @returns {number} 导入条数
+   */
+  function mergeImportedHosts(imported) {
+    const existingMap = new Map(hosts.map(h => [h.id, h]));
+    for (const item of imported) {
+      const host = {
+        id: item.id,
+        name: item.name,
+        url: item.url,
+        secretKey: item.secretKey || null
+      };
+      existingMap.set(host.id, host);
+    }
+    hosts = Array.from(existingMap.values());
+    saveHosts(hosts);
+
+    // 若当前激活主机的配置被覆盖，断开旧连接
+    const activeId = getActiveHostId();
+    if (activeId) {
+      const importedActive = imported.find(h => h.id === activeId);
+      if (importedActive) {
+        const rt = runtime.get(activeId);
+        if (rt && rt.client) {
+          try { rt.client.disconnect(); } catch {}
+          runtime.delete(activeId);
+        }
+      }
+    }
+
+    renderHostList();
+    refreshHostSelect();
+    return imported.length;
+  }
+
+  $('btnPasteImportOk').onclick = () => {
+    const raw = pasteImportArea.value.trim();
+    pasteImportError.style.display = 'none';
+    pasteImportError.textContent = '';
+
+    if (!raw) {
+      pasteImportError.textContent = '请粘贴 JSON 内容';
+      pasteImportError.style.display = 'block';
+      return;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      pasteImportError.textContent = '❌ JSON 格式错误：' + e.message;
+      pasteImportError.style.display = 'block';
+      return;
+    }
+
+    // 允许两种输入：数组，或单个对象（自动包装为数组）
+    let imported;
+    if (Array.isArray(parsed)) {
+      imported = parsed;
+    } else if (parsed && typeof parsed === 'object') {
+      imported = [parsed];
+    } else {
+      pasteImportError.textContent = '❌ JSON 根节点必须是数组或对象';
+      pasteImportError.style.display = 'block';
+      return;
+    }
+
+    if (imported.length === 0) {
+      pasteImportError.textContent = '❌ 没有可导入的设备配置';
+      pasteImportError.style.display = 'block';
+      return;
+    }
+
+    // 逐项校验
+    for (let i = 0; i < imported.length; i++) {
+      const item = imported[i];
+      if (!item || typeof item !== 'object') {
+        pasteImportError.textContent = `❌ 第 ${i + 1} 项不是有效的对象`;
+        pasteImportError.style.display = 'block';
+        return;
+      }
+      if (typeof item.id !== 'string' || item.id.trim() === '') {
+        pasteImportError.textContent = `❌ 第 ${i + 1} 项缺少有效的 id 字段`;
+        pasteImportError.style.display = 'block';
+        return;
+      }
+      if (typeof item.name !== 'string' || item.name.trim() === '') {
+        pasteImportError.textContent = `❌ 第 ${i + 1} 项缺少有效的 name 字段`;
+        pasteImportError.style.display = 'block';
+        return;
+      }
+      if (typeof item.url !== 'string' || item.url.trim() === '') {
+        pasteImportError.textContent = `❌ 第 ${i + 1} 项缺少有效的 url 字段`;
+        pasteImportError.style.display = 'block';
+        return;
+      }
+    }
+
+    try {
+      const count = mergeImportedHosts(imported);
+      pasteImportModal.style.display = 'none';
+      setStatus(`✅ 已粘贴导入 ${count} 个设备配置，当前共 ${hosts.length} 个`);
+    } catch (err) {
+      pasteImportError.textContent = '❌ 导入失败：' + err.message;
+      pasteImportError.style.display = 'block';
+    }
+  };
+
+  // Ctrl+Enter 快速导入
+  pasteImportArea.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && e.key === 'Enter') {
+      e.preventDefault();
+      $('btnPasteImportOk').click();
+    }
+  });
+
+  function renderHostList() {
+    const el = $('hostList');
+    el.innerHTML = '';
+    if (!hosts.length) {
+      el.innerHTML = '<div style="color:#95a5a6; padding:8px;">暂无设备</div>';
+      return;
+    }
+    hosts.forEach(h => {
+      const row = document.createElement('div');
+      row.className = 'host-item';
+      row.innerHTML = `
+        <div class="info">
+          <div class="name">${escapeHtml(h.name)}</div>
+          <div class="url">${escapeHtml(h.url)}${h.secretKey ? ' 🔒' : ''}</div>
+        </div>
+        <button data-act="edit">编辑</button>
+        <button data-act="del" style="background:#c0392b;">删除</button>
+      `;
+      row.querySelector('[data-act="edit"]').onclick = () => {
+        editingHostId = h.id;
+        $('hName').value = h.name;
+        $('hUrl').value = h.url;
+        $('hSecret').value = h.secretKey || '';
+      };
+      row.querySelector('[data-act="del"]').onclick = () => {
+        if (!confirm(`删除设备「${h.name}」？`)) return;
+        const rt = runtime.get(h.id);
+        if (rt && rt.client) { try { rt.client.disconnect(); } catch {} }
+        runtime.delete(h.id);
+        hosts = hosts.filter(x => x.id !== h.id);
+        saveHosts(hosts);
+        renderHostList();
+        refreshHostSelect();
+      };
+      el.appendChild(row);
+    });
+  }
+
+  // ============================================================
+  // 文件 / 文件夹收集
+  // ============================================================
+  const fileInput = $('fileInput');
+  const dirInput = $('dirInput');
+  const filePanel = $('filePanel');
+  const fileListBody = $('fileListBody');
+
+  function collectFilesFromInput(input) {
+    const out = [];
+    const files = Array.from(input.files || []);
+    for (const f of files) {
+      const rel = f.webkitRelativePath || f.name;
+      out.push({ file: f, rel });
+    }
+    return out;
+  }
+
+  async function collectFilesFromDrop(dataTransfer) {
+    const items = Array.from(dataTransfer.items || []);
+    const out = [];
+
+    if (items.length > 0 && typeof items[0].webkitGetAsEntry === 'function') {
+      const promises = items.map(item => {
+        const entry = item.webkitGetAsEntry();
+        if (!entry) return Promise.resolve();
+        return walkEntry(entry, '', out);
+      });
+      await Promise.all(promises);
+      if (out.length > 0) return out;
+    }
+
+    const files = Array.from(dataTransfer.files || []);
+    for (const f of files) {
+      const rel = f.webkitRelativePath || f.name;
+      out.push({ file: f, rel });
+    }
+    return out;
+  }
+
+  function walkEntry(entry, basePath, out) {
+    return new Promise((resolve) => {
+      if (entry.isFile) {
+        entry.file((file) => {
+          const rel = basePath ? basePath + '/' + file.name : file.name;
+          out.push({ file, rel });
+          resolve();
+        }, () => resolve());
+      } else if (entry.isDirectory) {
+        const reader = entry.createReader();
+        const dirPath = basePath ? basePath + '/' + entry.name : entry.name;
+
+        const readAll = () => {
+          reader.readEntries((entries) => {
+            if (entries.length === 0) {
+              resolve();
+              return;
+            }
+            const promises = entries.map(e => walkEntry(e, dirPath, out));
+            Promise.all(promises).then(readAll);
+          }, () => resolve());
+        };
+        readAll();
+      } else {
+        resolve();
+      }
+    });
+  }
+
+  async function uploadItems(items, concurrency = 4) {
+    const rt = getActiveRt();
+    if (!rt || !rt.connected) { setStatus('请先连接主机'); return; }
+
+    const total = items.length;
+    let done = 0;
+    let failed = 0;
+    const errors = [];
+
+    const queue = items.slice();
+
+    async function worker() {
+      while (queue.length > 0) {
+        const item = queue.shift();
+        if (!item) break;
+        try {
+          await rt.client.uploadFile(item.file, {
+            name: item.file.name,
+            rel: item.rel
+          });
+          done++;
+        } catch (err) {
+          failed++;
+          errors.push(`${item.rel}: ${err.message}`);
+          console.error('❌ 上传失败:', item.rel, err);
+        }
+        setStatus(`上传中 ${done + failed}/${total} (成功 ${done}, 失败 ${failed})`);
+      }
+    }
+
+    const workers = Array.from(
+      { length: Math.min(concurrency, Math.max(1, total)) },
+      () => worker()
+    );
+    await Promise.all(workers);
+
+    if (failed > 0) {
+      setStatus(`⚠️ 上传完成：成功 ${done}/${total}，失败 ${failed}`);
+      console.warn('上传失败详情:', errors);
+    } else {
+      setStatus(`✅ 上传完成：${done}/${total}`);
+    }
+  }
+
+  $('btnUpload').onclick = () => {
+    const rt = getActiveRt();
+    if (!rt || !rt.connected) { setStatus('请先连接主机'); return; }
+    fileInput.click();
+  };
+
+  $('btnUploadDir').onclick = () => {
+    const rt = getActiveRt();
+    if (!rt || !rt.connected) { setStatus('请先连接主机'); return; }
+    dirInput.click();
+  };
+
+  fileInput.onchange = async () => {
+    const items = collectFilesFromInput(fileInput);
+    fileInput.value = '';
+    if (items.length) await uploadItems(items);
+  };
+
+  dirInput.onchange = async () => {
+    const items = collectFilesFromInput(dirInput);
+    dirInput.value = '';
+    if (items.length) await uploadItems(items);
+  };
+
+  document.addEventListener('dragover', (e) => {
+    if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes('Files')) {
+      e.preventDefault();
+      document.body.classList.add('dragging');
+    }
+  });
+  document.addEventListener('dragleave', (e) => {
+    if (e.target === document.documentElement || e.relatedTarget === null) {
+      document.body.classList.remove('dragging');
+    }
+  });
+  document.addEventListener('drop', async (e) => {
+    if (!e.dataTransfer) return;
+    const hasFiles = (e.dataTransfer.types && e.dataTransfer.types.includes('Files'));
+    if (!hasFiles) return;
+
+    e.preventDefault();
+    document.body.classList.remove('dragging');
+
+    try {
+      const items = await collectFilesFromDrop(e.dataTransfer);
+      if (items.length) {
+        await uploadItems(items);
+      } else {
+        setStatus('没有可上传的文件');
+      }
+    } catch (err) {
+      console.error('drop 处理失败:', err);
+      setStatus('❌ 拖拽上传失败: ' + err.message);
+    }
+  });
+
+  $('btnFiles').onclick = async () => {
+    const rt = getActiveRt();
+    if (!rt || !rt.connected) { setStatus('请先连接主机'); return; }
+    filePanel.style.display = 'block';
+    await refreshFileList();
+  };
+
+  $('btnCloseFilePanel').onclick = () => { filePanel.style.display = 'none'; };
+  $('btnRefreshFiles').onclick = refreshFileList;
+
+  async function refreshFileList() {
+    const rt = getActiveRt();
+    if (!rt || !rt.connected) {
+      fileListBody.innerHTML = '<div style="color:#888; padding:8px;">未连接</div>';
+      return;
+    }
+    fileListBody.innerHTML = '<div style="color:#888; padding:8px;">加载中...</div>';
+    try {
+      const files = await rt.client.listFiles();
+      if (!files.length) {
+        fileListBody.innerHTML = '<div style="color:#888; padding:8px;">暂无文件</div>';
+        return;
+      }
+      fileListBody.innerHTML = '';
+      files.forEach(f => {
+        const row = document.createElement('div');
+        row.className = 'file-row';
+        row.innerHTML = `
+          <span class="name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</span>
+          <span class="size">${formatSize(f.size)}</span>
+          <button data-act="dl">下载</button>
+          <button class="rm" data-act="rm">删</button>
+        `;
+        row.querySelector('[data-act="dl"]').onclick = () => doDownload(f.name);
+        row.querySelector('[data-act="rm"]').onclick = () => doDelete(f.name);
+        fileListBody.appendChild(row);
+      });
+    } catch (e) {
+      fileListBody.innerHTML =
+        `<div style="color:#f66; padding:8px;">加载失败: ${escapeHtml(e.message)}</div>`;
+    }
+  }
+
+  async function doDownload(name) {
+    const rt = getActiveRt();
+    if (!rt || !rt.connected) return;
+    try {
+      setStatus(`下载 ${name} ...`);
+      await rt.client.downloadFile(name, {
+        onProgress: p => setStatus(`下载 ${name} ${(p * 100).toFixed(1)}%`)
+      });
+      setStatus(`✅ ${name} 下载完成`);
+    } catch (e) {
+      setStatus(`❌ 下载失败: ${e.message}`);
+    }
+  }
+
+  async function doDelete(name) {
+    const rt = getActiveRt();
+    if (!rt || !rt.connected) return;
+    if (!confirm(`确定删除 ${name}？`)) return;
+    try {
+      await rt.client.deleteFile(name);
+      await refreshFileList();
+      setStatus(`✅ ${name} 已删除`);
+    } catch (e) {
+      setStatus(`❌ 删除失败: ${e.message}`);
+    }
+  }
+
+  // ============================================================
+  // 执行命令
+  // ============================================================
+  const execModal = $('execModal');
+  const execCmd = $('execCmd');
+  const execMode = $('execMode');
+  const execTimeout = $('execTimeout');
+  const execResultWrap = $('execResultWrap');
+  const execResult = $('execResult');
+  const execExit = $('execExit');
+
+  $('btnExec').onclick = () => {
+    const rt = getActiveRt();
+    if (!rt || !rt.connected) {
+      setStatus('请先连接主机');
+      return;
+    }
+
+    execResult.textContent = '';
+    execResultWrap.style.display = 'none';
+    execExit.textContent = 'exitCode: -';
+    execExit.className = 'badge';
+
+    execModal.style.display = 'flex';
+    execCmd.focus();
+  };
+
+  $('btnExecCancel').onclick = () => {
+    execModal.style.display = 'none';
+  };
+
+  $('btnExecRun').onclick = async () => {
+    const rt = getActiveRt();
+    if (!rt || !rt.connected) {
+      setStatus('请先连接主机');
+      return;
+    }
+
+    const command = execCmd.value.trim();
+    if (!command) {
+      alert('请输入命令');
+      return;
+    }
+
+    const useSsh = execMode.value === 'ssh';
+    const timeout = parseInt(execTimeout.value, 10) || 60000;
+
+    $('btnExecRun').disabled = true;
+    $('btnExecRun').textContent = '执行中...';
+    setStatus('执行命令中...');
+
+    try {
+      const r = await rt.client.exec(command, {
+        useSsh,
+        timeout
+      });
+
+      execResultWrap.style.display = 'block';
+      let out = r.stdout || '(无输出)';
+      if (r.stderr) out += '\n\n[stderr]\n' + r.stderr;
+      execResult.textContent = out;
+
+      if (r.exitCode === 0) {
+        execExit.textContent = `exitCode: 0 ✅`;
+        execExit.className = 'badge ok';
+      } else if (r.exitCode == null) {
+        execExit.textContent = `exitCode: ? (超时/中断)`;
+        execExit.className = 'badge err';
+      } else {
+        execExit.textContent = `exitCode: ${r.exitCode} ❌`;
+        execExit.className = 'badge err';
+      }
+
+      setStatus(`✅ 执行完成 (exit ${r.exitCode})`);
+    } catch (e) {
+      execResultWrap.style.display = 'block';
+      execResult.textContent = `[错误] ${e.message}`;
+      execExit.textContent = `error`;
+      execExit.className = 'badge err';
+      setStatus(`❌ 执行失败: ${e.message}`);
+    } finally {
+      $('btnExecRun').disabled = false;
+      $('btnExecRun').textContent = '执行';
+    }
+  };
+
+  execCmd.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && e.key === 'Enter') {
+      e.preventDefault();
+      $('btnExecRun').click();
+    }
+  });
+
+  // ============================================================
+  // 窗口 resize
+  // ============================================================
+  let resizeTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      const rt = getActiveRt();
+      if (!rt || !rt.activeTermId) return;
+      const obj = rt.terminals.get(rt.activeTermId);
+      if (!obj) return;
+      try { obj.fitAddon.fit(); } catch {}
+      obj.term.resize(obj.xterm.cols, obj.xterm.rows).catch(() => {});
+    }, 100);
+  });
+
+  // ============================================================
+  // 启动
+  // ============================================================
+  refreshHostSelect();
+  updateNewTabState();
+
+  if (!hosts.length) {
+    $('btnManageHosts').click();
+  } else {
+    const firstId = hosts[0].id;
+    $('selHost').value = firstId;
+    try {
+      await ensureConnected(firstId);
+      updateNewTabState();
+    } catch (e) {
+      setStatus('自动连接失败: ' + e.message);
+    }
+  }
+
+  window.__pty = { hosts, runtime, getActiveRt, ensureConnected, createTerm };
+})();
+</script>
+
+</body>
+</html>

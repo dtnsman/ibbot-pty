@@ -1,0 +1,25 @@
+﻿{
+  "port": 10310,
+  "closed": false,
+  "secret_key": "",
+  "max_terminals": 50,
+  "idle_timeout": 0,
+  "ssh": {
+    "enabled": false,
+    "host": "",
+    "port": 22,
+    "user": "",
+    "auth": {
+      "type": "key",
+      "privateKeyPath": ""
+    },
+    "strictHostKeyChecking": true,
+    "knownHostsPath": ""
+  },
+  "tunnel": {
+    "enabled": false,
+    "server": "",
+    "token": "",
+    "name": ""
+  }
+}
