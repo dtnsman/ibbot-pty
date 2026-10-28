@@ -281,6 +281,9 @@ function readJsonBody(req, maxSize = 1024 * 1024) {
 // HTTP Server
 // ============================================================
 const server = http.createServer((req, res) => {
+  // 兜底：单个请求里的同步异常（例如非法响应头）不能让整个进程退出，
+  // 否则所有终端 WS 会一起断开、隧道表现为“断线重连”。
+  try {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Filename, X-Rel-Path');
@@ -453,13 +456,39 @@ const server = http.createServer((req, res) => {
     }
 
     const basename = path.basename(filePath);
-    res.writeHead(200, {
-      'Content-Type': 'application/octet-stream',
-      'Content-Length': st.size,
-      'Content-Disposition': `attachment; filename="${encodeURIComponent(basename)}"`,
-      'X-Filename': basename
+    // ★ HTTP 头只能是 latin1。中文等非 ASCII 文件名若原样写进头，
+    //   Node 会抛 ERR_INVALID_CHAR，未捕获时整个进程退出
+    //   （表现为下载瞬间所有终端 WS 断开、隧道重连）。
+    //   这里统一编码：Content-Disposition 用 RFC 5987 的 filename*，
+    //   X-Filename 也用 encodeURIComponent，保证头值恒为 ASCII。
+    const encodedName = encodeURIComponent(basename);
+    const asciiName = basename
+      .replace(/[^\x20-\x7e]/g, '_')
+      .replace(/["\\]/g, '_');
+    try {
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': st.size,
+        'Content-Disposition':
+          `attachment; filename="${asciiName}"; filename*=UTF-8''${encodedName}`,
+        'X-Filename': encodedName
+      });
+    } catch (e) {
+      return json(res, 500, { ret: false, msg: 'invalid filename: ' + e.message });
+    }
+
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', (e) => {
+      if (!res.headersSent) {
+        json(res, 500, { ret: false, msg: e.message });
+      } else {
+        try { res.destroy(); } catch {}
+      }
     });
-    fs.createReadStream(filePath).pipe(res);
+    // 客户端中断下载时释放文件句柄，避免 fd 泄漏
+    res.on('close', () => { try { stream.destroy(); } catch {} });
+    res.on('error', () => { try { stream.destroy(); } catch {} });
+    stream.pipe(res);
     return;
   }
 
@@ -541,13 +570,20 @@ const server = http.createServer((req, res) => {
 
   res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end('Not Found\n');
+  } catch (err) {
+    console.error('[PTY Server] request handler error:', err);
+    try {
+      if (!res.headersSent) json(res, 500, { ret: false, msg: err.message });
+      else res.destroy();
+    } catch {}
+  }
 });
 
 // ============================================================
 // WebSocket 挂到 HTTP server 上
 // ============================================================
 const manager = new SessionManager(setting);
-new WebSocketGateway({ server, manager, setting });
+const gateway = new WebSocketGateway({ server, manager, setting });
 
 server.listen(PORT, () => {
   console.log(`[PTY Server] listening on ws://0.0.0.0:${PORT}`);
@@ -571,14 +607,29 @@ server.listen(PORT, () => {
   }
 });
 
-process.on('SIGINT', () => {
-  console.log('\n[PTY Server] shutting down...');
-  if (tunnel) tunnel.stop();
-  manager.shutdown();
+// 优雅关闭：先断开 WS / 隧道，再关 HTTP，并设 3 秒兜底强制退出。
+// 不这样做的话 server.close() 会一直等未断开的终端 WS，
+// systemd 要等到 TimeoutStopSec（默认 90s）才 SIGKILL，重启窗口极长。
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n[PTY Server] shutting down (${signal})...`);
+
+  const force = setTimeout(() => process.exit(0), 3000);
+  force.unref();
+
+  try { if (tunnel) tunnel.stop(); } catch (e) {}
+  try { gateway.close(); } catch (e) {}
+  try { manager.shutdown(); } catch (e) {}
+
   server.close(() => process.exit(0));
-});
-process.on('SIGTERM', () => {
-  if (tunnel) tunnel.stop();
-  manager.shutdown();
-  server.close(() => process.exit(0));
-});
+  if (typeof server.closeAllConnections === 'function') {
+    try { server.closeAllConnections(); } catch (e) {}
+  }
+  if (typeof server.closeIdleConnections === 'function') {
+    try { server.closeIdleConnections(); } catch (e) {}
+  }
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));

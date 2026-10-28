@@ -219,6 +219,11 @@ class WebSocketGateway {
 
   close() {
     clearInterval(this._statsTimer);
+    // 主动断开客户端：否则 server.close() 会一直等这些 WS 结束，
+    // systemd stop 要等到 TimeoutStopSec（默认 90s）才 SIGKILL。
+    for (const client of this.wss.clients) {
+      try { client.terminate(); } catch (e) {}
+    }
     this.wss.close();
   }
 }

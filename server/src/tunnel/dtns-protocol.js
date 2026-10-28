@@ -417,14 +417,21 @@ function decodeWebSocketData(payload, flags) {
 function decodeWebSocketClose(payload) {
   const reader = new Reader(payload);
   const wsRequestId = reader.str();
-  const code = reader.u8();
+  const rawCode = reader.u8();
   const reason = reader.str();
   const timestamp = reader.str();
+
+  // 协议里 close code 只有 1 字节，1000 会被对端截成 232。
+  // 这里统一还原为合法的 1000，避免 ws.close(232) 抛 TypeError。
+  let code = rawCode;
+  if (!code || code < 1000 || code > 4999 || code === 1005 || code === 1006) {
+    code = 1000;
+  }
+
   return {
     type: 'websocket_close',
     wsRequestId,
-    // 0 是 1000 的线上表示；1005/1006 不能出现在 close 帧里
-    code: !code || code === 1005 || code === 1006 ? 1000 : code,
+    code,
     reason,
     timestamp,
   };

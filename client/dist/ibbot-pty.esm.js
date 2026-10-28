@@ -1,4 +1,4 @@
-/*! ibbot-pty-sdk v1.0.0 | MIT License */
+/*! ibbot-pty-sdk v1.0.0 | GPL-3.0-only License */
 class EventBus {
   constructor() {
     this._map = new Map();
@@ -759,6 +759,11 @@ class PtyClient {
       + '?name=' + encodeURIComponent(name)
       + '&rel=' + encodeURIComponent(rel);
     const headers = this._httpHeaders();
+    // ★ HTTP 头值必须是 ASCII（ByteString）。文件名/相对路径含中文时，
+    //   直接塞进 X-Filename / X-Rel-Path 会让浏览器 setRequestHeader 抛
+    //   TypeError，请求根本发不出去（表现为“上传失败”且 Network 面板为空）。
+    const headerName = encodeURIComponent(name);
+    const headerRel = encodeURIComponent(rel);
 
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -767,8 +772,8 @@ class PtyClient {
         try { xhr.setRequestHeader(k, headers[k]); } catch {}
       }
       xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-      xhr.setRequestHeader('X-Filename', name);
-      xhr.setRequestHeader('X-Rel-Path', rel);
+      xhr.setRequestHeader('X-Filename', headerName);
+      xhr.setRequestHeader('X-Rel-Path', headerRel);
 
       if (xhr.upload && opts.onProgress) {
         xhr.upload.onprogress = (e) => {
