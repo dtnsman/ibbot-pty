@@ -29,7 +29,7 @@
   var SDK_VERSION = (SDK && SDK.version) || '2.0.0';
 
   var SERVICE_NAME = 'pty-agent';
-  var SERVICE_VERSION = '2.0.0';
+  var SERVICE_VERSION = '2.1.0';
 
   var DEFAULT_WS_URL = 'wss://res2.dtns.top/tunnel';
   var DOMAIN_PREFIX = 'ai.pty2';
@@ -208,7 +208,21 @@
     clientId: null,
     allowDanger: false,
     wsUrl: DEFAULT_WS_URL,
-    createdAt: null
+    createdAt: null,
+    // ---- MCP ----
+    mcpEnabled: true,
+    mcpAllowWarn: true,
+    mcpAllowDanger: false,
+    mcpRequireApproval: false,
+    mcpReadOnly: false,
+    mcpApprovalTimeoutMs: 60000,
+    mcpMaxConcurrent: 4,
+    mcpRateLimitPerMin: 240,
+    mcpToken: '',
+    mcpAllowedOrigins: ['*'],
+    mcpDisabledTools: [],
+    mcpStrictHeaders: true,
+    mcpRequireClientCapabilities: false
   };
 
   function genClientId() {
@@ -513,6 +527,8 @@
     ['ALL', '/health', '健康检查'],
     ['ALL', '/api/info', '能力、域名与主机信息'],
     ['ALL', '/api/routes', '路由列表'],
+    ['GET', '/agent.json', '机器可读 API 说明（全部路由 / 参数 / 示例，源文件 agent.json）'],
+    ['GET', '/api.json', 'API 说明副本（与 agent.json 内容一致）'],
     ['ALL', '/api/hosts/list', '主机列表'],
     ['ALL', '/api/hosts/status', '主机状态'],
     ['ALL', '/api/pty/list', '终端列表'],
@@ -528,8 +544,74 @@
     ['ALL', '/api/fs/delete', '删除文件'],
     ['ALL', '/api/ai/context', 'AI 上下文（最近输出 / 最后命令 / cwd）'],
     ['ALL', '/api/security/check', '命令安全检查'],
+    ['ALL', '/api/mcp/info', 'MCP 端点信息、协议版本与工具清单'],
+    ['MCP', '/mcp', 'MCP Streamable HTTP（POST 调用 / GET 信息 / DELETE 405）'],
     ['WS', '/api/pty/stream', '终端实时输出流（WebSocket）']
   ];
+
+  // ============================================================
+  // 6.1 机器可读 API 说明（/agent.json · /api.json）
+  //     数据源：agent.json（同目录静态文件，供 HTTP-API 调用方直接读取）
+  //             页面内嵌副本：js/agent-doc.js（由 tools/build-agent-doc.js 生成）
+  // ============================================================
+  function agentDocFallback(app) {
+    var base = (app && app.apiBase) || Config.getUrl();
+    return {
+      ok: true,
+      schema: 'pty-agent-api/1',
+      name: 'PTY Agent HTTP API',
+      service: SERVICE_NAME,
+      version: SERVICE_VERSION,
+      sdkVersion: SDK_VERSION,
+      baseUrl: base,
+      baseUrlTemplate: false,
+      note: '未加载 js/agent-doc.js，以下仅为路由索引；完整说明见 agent.json / api.json',
+      endpoints: ROUTE_INFO.map(function (r) {
+        return { method: r[0], path: r[1], summary: r[2] };
+      })
+    };
+  }
+
+  // 返回文档副本，并把 baseUrl / mcp 端点等替换为运行时真实值（静态文件里是模板）
+  function agentDocPayload(app) {
+    var base = (app && app.apiBase) || Config.getUrl();
+    var src = ROOT.Pty2AgentDoc;
+    if (!src || typeof src !== 'object') return agentDocFallback(app);
+
+    var doc;
+    try {
+      doc = JSON.parse(JSON.stringify(src));
+    } catch (e) {
+      return agentDocFallback(app);
+    }
+
+    doc.baseUrl = base;
+    doc.baseUrlTemplate = false;
+    doc.runtime = {
+      clientId: app.clientId,
+      domain: app.domain,
+      apiBase: base,
+      version: SERVICE_VERSION,
+      sdkVersion: SDK_VERSION,
+      allowDanger: Config.get().allowDanger === true,
+      mcpEnabled: Config.get().mcpEnabled !== false,
+      mcpEndpoint: base + '/mcp',
+      wsEndpoint: base.replace(/^http/i, 'ws') + '/api/pty/stream',
+      servedAt: new Date().toISOString()
+    };
+
+    if (doc.mcp && typeof doc.mcp === 'object') {
+      doc.mcp.endpoint = base + '/mcp';
+      if (doc.mcp.clientConfig && doc.mcp.clientConfig.mcpServers && doc.mcp.clientConfig.mcpServers.pty2) {
+        var args = doc.mcp.clientConfig.mcpServers.pty2.args;
+        if (Array.isArray(args) && args.length) args[args.length - 1] = base + '/mcp';
+      }
+    }
+    if (doc.websocket && typeof doc.websocket === 'object') {
+      doc.websocket.url = base.replace(/^http/i, 'ws') + '/api/pty/stream?termId=<termId>&lines=50';
+    }
+    return doc;
+  }
 
   // ============================================================
   // 7. 路由实现
@@ -575,6 +657,7 @@
 
       '/health': function (req, res) {
         var st = app.status();
+        var mcpStats = app.__mcpServer ? app.__mcpServer.stats() : null;
         return res.json({
           status: 'ok',
           service: SERVICE_NAME,
@@ -589,6 +672,7 @@
           requests: st.requests,
           errors: st.errors,
           uptimeMs: st.uptimeMs,
+          mcp: mcpStats || { enabled: Config.get().mcpEnabled !== false, requests: 0, toolCalls: 0 },
           timestamp: new Date().toISOString()
         });
       },
@@ -604,6 +688,7 @@
         if (!defaultHostId) {
           defaultHostId = (ctx.hosts && ctx.hosts[0] && ctx.hosts[0].id) || null;
         }
+        var mcpTools = ROOT.Pty2Mcp ? ROOT.Pty2Mcp.TOOLS.length : 0;
         return ok(res, {
           name: 'PTY Agent Service',
           version: SERVICE_VERSION,
@@ -617,8 +702,16 @@
             'pty_create', 'pty_write', 'pty_read', 'pty_resize', 'pty_destroy', 'pty_list', 'pty_stream',
             'exec_local', 'exec_ssh',
             'fs_list', 'fs_download', 'fs_download_raw', 'fs_upload', 'fs_upload_raw', 'fs_delete',
-            'ai_context', 'security_check'
+            'ai_context', 'security_check',
+            'mcp', 'mcp_tools', 'mcp_resources', 'mcp_prompts'
           ],
+          mcp: {
+            enabled: cfg.mcpEnabled !== false,
+            endpoint: app.apiBase + '/mcp',
+            transport: 'streamable-http',
+            protocolVersions: ROOT.Pty2Mcp ? ROOT.Pty2Mcp.PROTOCOL_VERSIONS : [],
+            tools: mcpTools
+          },
           hosts: (ctx.hosts || []).map(function (h) {
             return { id: h.id, name: h.name, url: h.url };
           }),
@@ -633,6 +726,27 @@
           routes: ROUTE_INFO.map(function (r) {
             return { method: r[0], path: r[1], desc: r[2] };
           })
+        });
+      },
+
+      // 机器可读 API 说明：直接返回文档本身（不带 success 包装，方便按 schema 解析）
+      '/agent.json': function (req, res) {
+        return res.status(200).json(agentDocPayload(app));
+      },
+
+      '/api.json': function (req, res) {
+        return res.status(200).json(agentDocPayload(app));
+      },
+
+      '/api/mcp/info': function (req, res) {
+        var cfg = Config.get();
+        if (app.__mcpServer) return ok(res, app.__mcpServer.info());
+        return ok(res, {
+          enabled: cfg.mcpEnabled !== false,
+          started: false,
+          endpoint: app.apiBase + '/mcp',
+          protocolVersions: ROOT.Pty2Mcp ? ROOT.Pty2Mcp.PROTOCOL_VERSIONS : [],
+          tools: ROOT.Pty2Mcp ? ROOT.Pty2Mcp.TOOLS.map(function (t) { return t.name; }) : []
         });
       },
 
@@ -1262,18 +1376,117 @@
   // ============================================================
   // 9. 挂载路由到 DTNSAgent app
   // ============================================================
-  function defineRoutes(app, ctx) {
+  // 把 Express 风格 handler 包装成 (path, params) -> Promise<{status, body}>
+  // 供 MCP 层复用既有业务逻辑，避免重复实现。
+  function makeHandlerCaller(handlers) {
+    return function (path, params) {
+      return new Promise(function (resolve, reject) {
+        var handler = handlers[path];
+        if (typeof handler !== 'function') return reject(new Error('unknown handler: ' + path));
+
+        var out = null;
+        var req = {
+          method: 'POST',
+          path: path,
+          query: {},
+          params: {},
+          body: Object.assign({}, params || {}),
+          headers: {},
+          rawBody: new Uint8Array(0),
+          get: function (name) {
+            return String(name).toLowerCase() === 'content-type' ? 'application/json' : undefined;
+          }
+        };
+        var res = {
+          statusCode: 200,
+          headers: {},
+          finished: false,
+          status: function (code) { this.statusCode = Number(code) || 200; return this; },
+          set: function (key, value) { this.headers[String(key).toLowerCase()] = String(value); return this; },
+          json: function (value) { out = { status: this.statusCode, body: value }; this.finished = true; return this; },
+          send: function (value) { out = { status: this.statusCode, body: value }; this.finished = true; return this; },
+          end: function (value) {
+            if (!out) out = { status: this.statusCode, body: value === undefined ? null : value };
+            this.finished = true;
+            return this;
+          }
+        };
+
+        var result;
+        try {
+          result = handler(req, res);
+        } catch (error) {
+          return reject(error);
+        }
+
+        Promise.resolve(result).then(function () {
+          if (!out) return reject(new Error('handler did not respond: ' + path));
+          resolve(out);
+        }, reject);
+      });
+    };
+  }
+
+  function defineMcpRoutes(app, ctx, handlers, options) {
+    var MCP = ROOT.Pty2Mcp;
+    if (!MCP) {
+      console.warn('[Pty2Agent] mcp-server.js 未加载，/mcp 不可用');
+      return;
+    }
+
+    var logger = (options && typeof options.log === 'function') ? options.log : null;
+
+    var server = MCP.createServer({
+      call: makeHandlerCaller(handlers),
+      getConfig: function () { return Config.get(); },
+      getService: function () {
+        return {
+          domain: app.domain,
+          apiBase: app.apiBase,
+          clientId: app.clientId,
+          version: SERVICE_VERSION,
+          sdkVersion: SDK_VERSION
+        };
+      },
+      log: function (entry) {
+        if (!logger) return;
+        try {
+          var parts = ['MCP ' + (entry.method || '')];
+          if (entry.tool) parts.push(entry.tool);
+          if (entry.isError) parts.push('❌');
+          if (entry.reason) parts.push(entry.reason);
+          if (entry.ms !== undefined) parts.push(entry.ms + 'ms');
+          logger(parts.join(' '), entry.isError ? 'warn' : 'info');
+        } catch (e) { /* ignore */ }
+      }
+    });
+
+    app.__mcpServer = server;
+
+    app.post('/mcp', function (req, res) {
+      return server.handlePost(req, res);
+    });
+    app.get('/mcp', function (req, res) {
+      return server.handleGet(req, res);
+    });
+    app.delete('/mcp', function (req, res) {
+      return server.handleDelete(req, res);
+    });
+  }
+
+  function defineRoutes(app, ctx, options) {
     var handlers = createHandlers(app, ctx);
 
-    // 9.1 CORS + X-Pty-Agent-Duration（保持 v1 的跨域行为）
+    // 9.1 CORS（按要求放开所有跨域；Access-Control-Allow-* 使用 *）
     app.use(function (req, res, next) {
       var startedAt = Date.now();
 
       res.set('access-control-allow-origin', '*');
-      res.set('access-control-allow-methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+      res.set('access-control-allow-methods', '*, GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
       res.set('access-control-allow-headers',
-        'Content-Type, Authorization, X-Requested-With, X-Request-ID, X-Filename, X-Rel-Path');
-      res.set('access-control-expose-headers', 'X-Pty-Agent-Duration');
+        '*, Authorization, Content-Type, Accept, X-Requested-With, X-Request-ID, X-Filename, X-Rel-Path, ' +
+        'MCP-Protocol-Version, Mcp-Method, Mcp-Name, Mcp-Session-Id, Last-Event-ID');
+      res.set('access-control-expose-headers', '*');
       res.set('access-control-max-age', '86400');
 
       var originalEnd = res.end;
@@ -1295,7 +1508,7 @@
     // 9.3 所有 API 路由都接受任意方法（与 v1 的 GET/POST 双向兜底一致）
     ROUTE_INFO.forEach(function (info) {
       var path = info[1];
-      if (info[0] === 'WS') return;
+      if (info[0] === 'WS' || info[0] === 'MCP') return;
       var handler = handlers[path];
       if (typeof handler !== 'function') return;
 
@@ -1311,7 +1524,10 @@
       });
     });
 
-    // 9.4 WebSocket 终端实时流
+    // 9.4 MCP Streamable HTTP（POST / GET / DELETE）
+    defineMcpRoutes(app, ctx, handlers, options);
+
+    // 9.5 WebSocket 终端实时流
     app.ws('/api/pty/stream', function (ws, req) {
       try {
         handlePtyStream(app, ctx, ws, req);
@@ -1395,7 +1611,7 @@
         var btn = document.createElement('button');
         btn.id = 'btnPty2Agent';
         btn.textContent = '🤖 Agent';
-        btn.title = 'PTY Agent (sdk.js) HTTP-Proxy：让 AI Agent 通过 HTTP / WebSocket 控制 PTY';
+        btn.title = 'PTY Agent (sdk.js)：让 AI Agent 通过 HTTP / WebSocket / MCP 控制 PTY';
         btn.style.background = '#8e44ad';
         btn.style.color = '#fff';
         btn.onclick = function () { self.show(); };
@@ -1483,6 +1699,54 @@
           </div>
         </div>
 
+        <div style="margin-bottom:10px;">
+          <label style="display:block; color:#bdc3c7; margin-bottom:4px;">MCP 端点（Streamable HTTP）</label>
+          <div class="p2a-row" style="display:flex; gap:6px;">
+            <input id="p2aMcpUrl" type="text" readonly style="flex:1; padding:6px; background:#1e1e1e; color:#8cf; border:1px solid #444; border-radius:4px; font-family:monospace; font-size:12px;">
+            <button id="p2aCopyMcp" style="padding:6px 10px;">📋</button>
+            <button id="p2aOpenMcp" style="padding:6px 10px;">🔗</button>
+          </div>
+        </div>
+
+        <div style="margin-bottom:10px;">
+          <label style="display:block; color:#bdc3c7; margin-bottom:4px;">API 说明（agent.json · api.json 为其副本）</label>
+          <div class="p2a-row" style="display:flex; gap:6px;">
+            <input id="p2aAgentDocUrl" type="text" readonly style="flex:1; padding:6px; background:#1e1e1e; color:#fbbf24; border:1px solid #444; border-radius:4px; font-family:monospace; font-size:12px;">
+            <button id="p2aCopyAgentDoc" title="复制 agent.json 地址" style="padding:6px 10px;">📋</button>
+            <button id="p2aOpenAgentDoc" title="打开 agent.json" style="padding:6px 10px;">🔗</button>
+            <button id="p2aOpenApiDoc" title="打开 api.json（内容与 agent.json 一致）" style="padding:6px 10px;">api.json</button>
+          </div>
+        </div>
+
+        <div style="margin-bottom:10px; display:flex; flex-direction:column; gap:6px;">
+          <label style="display:flex; align-items:center; gap:6px; color:#bdc3c7; cursor:pointer;">
+            <input id="p2aMcpEnabled" type="checkbox">
+            启用 MCP 端点 /mcp（默认开启）
+          </label>
+          <label style="display:flex; align-items:center; gap:6px; color:#bdc3c7; cursor:pointer;">
+            <input id="p2aMcpWarn" type="checkbox">
+            允许 MCP 执行 warn 级命令（默认开启）
+          </label>
+          <label style="display:flex; align-items:center; gap:6px; color:#bdc3c7; cursor:pointer;">
+            <input id="p2aMcpDanger" type="checkbox">
+            允许 MCP 执行 danger 级命令（默认关闭）
+          </label>
+          <label style="display:flex; align-items:center; gap:6px; color:#bdc3c7; cursor:pointer;">
+            <input id="p2aMcpApproval" type="checkbox">
+            MCP 写/执行前需页面确认（默认关闭）
+          </label>
+          <label style="display:flex; align-items:center; gap:6px; color:#bdc3c7; cursor:pointer;">
+            <input id="p2aMcpReadOnly" type="checkbox">
+            MCP 只读模式（禁用 exec / 写入 / 删除）
+          </label>
+        </div>
+
+        <div style="display:flex; gap:8px; margin-bottom:10px;">
+          <input id="p2aMcpToken" type="text" placeholder="MCP Token（可选，留空则不校验）" style="flex:1; padding:6px; background:#1e1e1e; color:#eee; border:1px solid #444; border-radius:4px; font-family:monospace; font-size:12px;">
+          <button id="p2aMcpTokenGen" style="padding:6px 10px;">生成</button>
+          <button id="p2aMcpTokenSave" style="padding:6px 10px;">保存</button>
+        </div>
+
         <div style="margin-bottom:10px; display:flex; flex-direction:column; gap:6px;">
           <label style="display:flex; align-items:center; gap:6px; color:#bdc3c7; cursor:pointer;">
             <input id="p2aAllowDanger" type="checkbox">
@@ -1514,6 +1778,11 @@
           <div id="p2aWsDoc" style="background:#1e1e1e; padding:8px; border-radius:4px; font-family:monospace; font-size:11px; max-height:220px; overflow:auto; line-height:1.6; white-space:pre-wrap; word-break:break-all;"></div>
         </details>
 
+        <details style="margin-bottom:10px;">
+          <summary style="cursor:pointer; color:#a5b4fc; margin-bottom:6px;">🧩 MCP 客户端配置</summary>
+          <div id="p2aMcpConfig" style="background:#1e1e1e; padding:8px; border-radius:4px; font-family:monospace; font-size:11px; max-height:260px; overflow:auto; line-height:1.6; white-space:pre-wrap; word-break:break-all;"></div>
+        </details>
+
         <div style="margin-bottom:6px; display:flex; justify-content:space-between; align-items:center;">
           <b style="color:#a5b4fc;">📋 日志</b>
           <button id="p2aClearLog" style="padding:2px 8px; font-size:11px;">清空</button>
@@ -1534,8 +1803,57 @@
       $('p2aCopyId').onclick = function () { self._copy(Config.current.clientId); };
       $('p2aCopyUrl').onclick = function () { self._copy(Config.getUrl()); };
       $('p2aOpenUrl').onclick = function () { window.open(Config.getUrl() + '/api/info', '_blank'); };
+      $('p2aCopyMcp').onclick = function () { self._copy(Config.getUrl() + '/mcp'); };
+      $('p2aOpenMcp').onclick = function () { window.open(Config.getUrl() + '/mcp', '_blank'); };
+      $('p2aCopyAgentDoc').onclick = function () { self._copy(Config.getUrl() + '/agent.json'); };
+      $('p2aOpenAgentDoc').onclick = function () { window.open(Config.getUrl() + '/agent.json', '_blank'); };
+      $('p2aOpenApiDoc').onclick = function () { window.open(Config.getUrl() + '/api.json', '_blank'); };
       $('p2aRegenId').onclick = function () { self._onRegenId(); };
       $('p2aClearLog').onclick = function () { self.logLines = []; self._renderLog(); };
+      $('p2aMcpEnabled').onchange = function (e) {
+        Config.update({ mcpEnabled: e.target.checked });
+        self._log('mcpEnabled = ' + e.target.checked, e.target.checked ? 'info' : 'warn');
+        self._refresh();
+      };
+      $('p2aMcpWarn').onchange = function (e) {
+        Config.update({ mcpAllowWarn: e.target.checked });
+        self._log('mcpAllowWarn = ' + e.target.checked, 'warn');
+      };
+      $('p2aMcpDanger').onchange = function (e) {
+        Config.update({ mcpAllowDanger: e.target.checked });
+        self._log('mcpAllowDanger = ' + e.target.checked, 'error');
+      };
+      $('p2aMcpApproval').onchange = function (e) {
+        Config.update({ mcpRequireApproval: e.target.checked });
+        self._log('mcpRequireApproval = ' + e.target.checked, 'warn');
+      };
+      $('p2aMcpReadOnly').onchange = function (e) {
+        Config.update({ mcpReadOnly: e.target.checked });
+        self._log('mcpReadOnly = ' + e.target.checked, e.target.checked ? 'warn' : 'info');
+        self._refresh();
+      };
+      $('p2aMcpTokenGen').onclick = function () {
+        var token;
+        try {
+          if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+            var bytes = new Uint8Array(24);
+            window.crypto.getRandomValues(bytes);
+            token = 'mcp_' + Array.prototype.map.call(bytes, function (b) {
+              return ('0' + b.toString(16)).slice(-2);
+            }).join('');
+          }
+        } catch (e) { token = null; }
+        if (!token) {
+          token = 'mcp_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+        }
+        $('p2aMcpToken').value = token;
+        Config.update({ mcpToken: token });
+        self._log('已生成 MCP Token（所有 MCP 请求需带 Authorization: Bearer）', 'warn');
+      };
+      $('p2aMcpTokenSave').onclick = function () {
+        Config.update({ mcpToken: $('p2aMcpToken').value.trim() });
+        self._log('MCP Token 已保存', 'info');
+      };
       $('p2aAllowDanger').onchange = function (e) {
         Config.update({ allowDanger: e.target.checked });
         self._log('allowDanger = ' + e.target.checked, 'warn');
@@ -1550,6 +1868,7 @@
       this._renderRoutes();
       this._renderCurl();
       this._renderWsDoc();
+      this._renderMcpConfig();
     }
 
     show() {
@@ -1620,8 +1939,18 @@
       $('p2aStop').style.display = status.started ? 'block' : 'none';
       $('p2aClientId').value = status.clientId || '';
       $('p2aUrl').value = status.url || '';
+      $('p2aMcpUrl').value = (status.url || Config.getUrl()) + '/mcp';
+      $('p2aAgentDocUrl').value = (status.url || Config.getUrl()) + '/agent.json';
       $('p2aAllowDanger').checked = cfg.allowDanger === true;
       $('p2aAutoStart').checked = cfg.autoStart === true;
+      $('p2aMcpEnabled').checked = cfg.mcpEnabled !== false;
+      $('p2aMcpWarn').checked = cfg.mcpAllowWarn !== false;
+      $('p2aMcpDanger').checked = cfg.mcpAllowDanger === true;
+      $('p2aMcpApproval').checked = cfg.mcpRequireApproval === true;
+      $('p2aMcpReadOnly').checked = cfg.mcpReadOnly === true;
+      if (document.activeElement !== $('p2aMcpToken')) {
+        $('p2aMcpToken').value = cfg.mcpToken || '';
+      }
 
       var dot = function (ok) { return ok ? '🟢' : '🔴'; };
       var uptime = function (ms) {
@@ -1633,12 +1962,16 @@
         if (min > 0) return min + 'm ' + (sec % 60) + 's';
         return sec + 's';
       };
+      var mcpStats = status.mcp || { toolCalls: 0, requests: 0, errors: 0, tools: 0 };
 
       $('p2aStatus').innerHTML = [
         '<div>' + dot(status.started) + ' 服务：<b>' + (status.started ? '运行中' : '未启动') + '</b>' +
           (status.sdkVersion ? ' <span style="color:#777;">sdk.js v' + escapeHtml(status.sdkVersion) + '</span>' : '') + '</div>',
         '<div>' + dot(status.connected) + ' 隧道：<b>' + (status.connected ? '已连接' : '未连接') + '</b></div>',
         '<div>' + dot(status.registered) + ' 域名：<b>' + (status.registered ? '已注册' : '未注册') + '</b></div>',
+        '<div>🔌 MCP：<b>' + (cfg.mcpEnabled !== false ? (cfg.mcpReadOnly === true ? '只读' : '启用') : '关闭') + '</b> · 工具 ' +
+          (mcpStats.tools || 0) + ' · 调用 ' + (mcpStats.toolCalls || 0) +
+          ' 次 · 错误 ' + (mcpStats.errors || 0) + ' 次</div>',
         '<div>📊 请求 ' + (status.requests || 0) + ' 次 · 错误 ' + (status.errors || 0) +
           ' 次 · WebSocket ' + (status.websockets || 0) + ' 个</div>',
         status.started
@@ -1646,6 +1979,8 @@
           : '',
         '<div style="color:#888;">🔗 隧道服务：' + escapeHtml(cfg.wsUrl || DEFAULT_WS_URL) + '</div>'
       ].join('');
+
+      this._renderMcpConfig();
     }
 
     _renderRoutes() {
@@ -1654,7 +1989,7 @@
       if (!el) return;
 
       el.innerHTML = this.agent.listRoutes().map(function (r) {
-        var color = r.method === 'WS' ? '#c084fc' : (r.method === 'GET' ? '#6ee7b7' : '#fbbf24');
+        var color = r.method === 'WS' ? '#c084fc' : (r.method === 'MCP' ? '#f472b6' : (r.method === 'GET' ? '#6ee7b7' : '#fbbf24'));
         return '<div><span style="color:' + color + '; font-weight:bold;">' + r.method + '</span> ' +
           escapeHtml(r.path) + '<span style="color:#777;"> — ' + escapeHtml(r.desc || '') + '</span></div>';
       }).join('');
@@ -1669,6 +2004,9 @@
       el.textContent = [
         '# 0. 端点索引',
         'curl ' + url + '/',
+        '',
+        '# 0.1 机器可读 API 说明（全部路由 / 参数 / 示例；api.json 内容相同）',
+        'curl ' + url + '/agent.json',
         '',
         '# 1. 健康检查',
         'curl ' + url + '/health',
@@ -1706,7 +2044,31 @@
         'curl -o a.txt "' + url + '/api/fs/download?name=a.txt&raw=1"',
         '',
         '# 8. AI 上下文',
-        'curl "' + url + '/api/ai/context?lines=30"'
+        'curl "' + url + '/api/ai/context?lines=30"',
+        '',
+        '# 9. MCP：GET 端点信息（也可用 Accept: text/event-stream 取单条 SSE）',
+        'curl ' + url + '/mcp',
+        '',
+        '# 10. MCP：legacy initialize（2025-06-18）',
+        'curl -X POST ' + url + '/mcp \\',
+        "  -H 'Content-Type: application/json' \\",
+        '  -d \'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}\'',
+        '',
+        '# 11. MCP：modern tools/list（2026-07-28）',
+        'curl -X POST ' + url + '/mcp \\',
+        "  -H 'Content-Type: application/json' \\",
+        "  -H 'Accept: application/json, text/event-stream' \\",
+        "  -H 'MCP-Protocol-Version: 2026-07-28' \\",
+        "  -H 'Mcp-Method: tools/list' \\",
+        '  -d \'{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}\'',
+        '',
+        '# 12. MCP：tools/call host_list',
+        'curl -X POST ' + url + '/mcp \\',
+        "  -H 'Content-Type: application/json' \\",
+        "  -H 'MCP-Protocol-Version: 2026-07-28' \\",
+        "  -H 'Mcp-Method: tools/call' \\",
+        "  -H 'Mcp-Name: host_list' \\",
+        '  -d \'{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"host_list","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}\''
       ].join('\n');
     }
 
@@ -1745,6 +2107,39 @@
       });
       if (this.logLines.length > 100) this.logLines.pop();
       this._renderLog();
+    }
+
+    _renderMcpConfig() {
+      if (!this.panelEl) return;
+      var el = document.getElementById('p2aMcpConfig');
+      if (!el) return;
+
+      var endpoint = Config.getUrl() + '/mcp';
+      var config = {
+        mcpServers: {
+          pty2: {
+            command: 'npx',
+            args: ['-y', 'mcp-remote', endpoint]
+          }
+        }
+      };
+
+      el.textContent = [
+        '# Claude Desktop / Cursor（经 mcp-remote 桥接）',
+        JSON.stringify(config, null, 2),
+        '',
+        '# MCP Inspector',
+        'npx @modelcontextprotocol/inspector',
+        '# Transport: Streamable HTTP',
+        '# URL: ' + endpoint,
+        '',
+        '# 说明',
+        '# - GET  /mcp 返回端点信息；Accept: text/event-stream 时走 SSE 流',
+        '# - POST /mcp 支持 JSON 或 SSE 响应（SSE 逐条推送，由隧道旧 SSE 旁路承载）',
+        '# - subscriptions/listen 会保持 SSE 连接并返回 acknowledged',
+        '# - modern 2026-07-28 需要 MCP-Protocol-Version / Mcp-Method / Mcp-Name 头',
+        '# - legacy 2025-06-18 直接 initialize + tools/list + tools/call'
+      ].join('\n');
     }
 
     _renderLog() {
@@ -1837,9 +2232,11 @@
         clientId: cfg.clientId
       });
 
-      defineRoutes(app, this.ctx);
-
       var self = this;
+      defineRoutes(app, this.ctx, {
+        log: function (msg, level) { self.ui._log(msg, level || 'info'); }
+      });
+
       app.on('reconnected', function () { self.emit('reconnected', self.getStatus()); });
       app.on('disconnected', function (info) { self.emit('disconnected', info); });
       app.on('reconnecting', function (info) { self.emit('reconnecting', info); });
@@ -1891,6 +2288,20 @@
 
     getStatus() {
       var cfg = Config.get();
+      var mcpStats = this.app && this.app.__mcpServer ? this.app.__mcpServer.stats() : {
+        enabled: cfg.mcpEnabled !== false,
+        requests: 0,
+        errors: 0,
+        denied: 0,
+        toolCalls: 0,
+        active: 0,
+        tools: ROOT.Pty2Mcp ? ROOT.Pty2Mcp.TOOLS.length : 0,
+        resources: 0,
+        prompts: 0,
+        uptimeMs: 0,
+        toolCounts: {},
+        recent: []
+      };
       var base = {
         started: !!this.app,
         enabled: cfg.enabled === true,
@@ -1900,7 +2311,8 @@
         domain: Config.getDomain(cfg.clientId),
         url: Config.getUrl(cfg.clientId),
         wsUrl: cfg.wsUrl || DEFAULT_WS_URL,
-        sdkVersion: SDK ? SDK.version : null
+        sdkVersion: SDK ? SDK.version : null,
+        mcp: mcpStats
       };
 
       if (!this.app) {
@@ -1921,7 +2333,8 @@
         started: true,
         allowDanger: cfg.allowDanger === true,
         autoStart: cfg.autoStart === true,
-        sdkVersion: SDK ? SDK.version : null
+        sdkVersion: SDK ? SDK.version : null,
+        mcp: mcpStats
       });
     }
   }

@@ -31,22 +31,24 @@
 - **一次性命令**：`POST /exec` 直接拿 stdout / stderr / exitCode，不用开终端。
 - **内网穿透**：内置 DTNS HTTP-Proxy 隧道客户端，把 HTTP + WebSocket 一起暴露到公网域名。
 - **弱网优化**：16ms 输出合并、积压超限丢旧保新、`exit` 等关键帧强制送达。
+- **内置 MCP 端点**：同一套终端能力以 MCP（Model Context Protocol）暴露，Claude Desktop / Cursor / 各类 Agent 框架可直接挂载，不用写胶水层。
+- **机器可读 API 说明**：`/agent.json`、`/api.json` 返回结构化接口文档，Agent 拿到域名即可自助接入。
 - **可嵌入**：`ibbot-pty-sdk` 提供 `attachXterm()` 一行接入。
 
 ---
 
 ## 三、与同类项目对比
 
-| 项目 | 形态 | 多主机聚合 | 断线回放 | 文件传输 | 内置穿透 | 可嵌入 SDK | 浏览器内 Agent | 多用户 / RBAC | 部署成本 |
-|---|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|---|
-| [ttyd](https://github.com/tsl0922/ttyd) | C 单二进制 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | 极低 |
-| [GoTTY](https://github.com/yudai/gotty) | Go 单二进制 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | 极低 |
-| [Wetty](https://github.com/butlerx/wetty) | Node 服务 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | 低 |
-| [ShellHub](https://github.com/shellhub-io/shellhub) | 中心服务器 + 每设备 Agent | ✅ | 服务端录制* | ✅ SFTP/SCP | ❌ 需自建可达 | ⚠️ HTTP API | ❌ 需装 Agent | ✅ | 高 |
-| [Apache Guacamole](https://guacamole.apache.org/) | Java 网关 + Tomcat | ✅ | 会话录制 | ✅ SFTP | ❌ | ❌ | ❌ | ✅ | 高 |
-| [Teleport](https://github.com/gravitational/teleport) | Go 集群 | ✅ | 会话录制 | ✅ | ✅ 反向隧道 | ⚠️ API | ❌ | ✅ SSO | 高 |
-| [code-server](https://github.com/coder/code-server) | Node 应用 | ❌ | ❌ | ✅ 编辑器 | ❌ 需反代 | ❌ | ❌ | ⚠️ 单用户 | 中 |
-| **IBBot PTY Manager** | **Node 服务 + 浏览器 SDK** | **✅** | **✅ 环形缓冲** | **✅ HTTP 直传** | **✅ 内置** | **✅ 完整 SDK** | **✅ 一个网页即 Agent** | **❌ 单密钥** | **低** |
+| 项目 | 形态 | 多主机聚合 | 断线回放 | 文件传输 | 内置穿透 | 可嵌入 SDK | 浏览器内 Agent | MCP 端点 | 多用户 / RBAC | 部署成本 |
+|---|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|---|
+| [ttyd](https://github.com/tsl0922/ttyd) | C 单二进制 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | 极低 |
+| [GoTTY](https://github.com/yudai/gotty) | Go 单二进制 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | 极低 |
+| [Wetty](https://github.com/butlerx/wetty) | Node 服务 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | 低 |
+| [ShellHub](https://github.com/shellhub-io/shellhub) | 中心服务器 + 每设备 Agent | ✅ | 服务端录制* | ✅ SFTP/SCP | ❌ 需自建可达 | ⚠️ HTTP API | ❌ 需装 Agent | ❌ | ✅ | 高 |
+| [Apache Guacamole](https://guacamole.apache.org/) | Java 网关 + Tomcat | ✅ | 会话录制 | ✅ SFTP | ❌ | ❌ | ❌ | ❌ | ✅ | 高 |
+| [Teleport](https://github.com/gravitational/teleport) | Go 集群 | ✅ | 会话录制 | ✅ | ✅ 反向隧道 | ⚠️ API | ❌ | ❌ | ✅ SSO | 高 |
+| [code-server](https://github.com/coder/code-server) | Node 应用 | ❌ | ❌ | ✅ 编辑器 | ❌ 需反代 | ❌ | ❌ | ❌ | ⚠️ 单用户 | 中 |
+| **IBBot PTY Manager** | **Node 服务 + 浏览器 SDK** | **✅** | **✅ 环形缓冲** | **✅ HTTP 直传** | **✅ 内置** | **✅ 完整 SDK** | **✅ 一个网页即 Agent** | **✅ 内置 MCP** | **❌ 单密钥** | **低** |
 
 \* ShellHub 社区版为浏览器本地录制，服务端集中存储属于 Cloud / Enterprise 版。
 
@@ -117,6 +119,45 @@ term.attachXterm(xtermInstance);   // 一行接管键盘与尺寸
 | `/api/exec` | POST | 一次性命令（local / ssh） |
 
 LLM Agent 用 `create → write → read` 就能驱动一台设备，完全不需要理解终端渲染或 WebSocket 帧。
+
+#### 6.1 MCP 端点：Agent 直接挂载，不用写胶水层
+
+`client/js/mcp-server.js` 把上面这套 HTTP API 包装成标准 **MCP（Streamable HTTP）** 端点，协议兼容 MCP `2026-07-28`（modern）与 `2025-11-25` / `2025-06-18` / `2025-03-26`（legacy）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/mcp` | JSON-RPC 主入口，返回 `application/json` 或 `text/event-stream` |
+| `GET` | `/mcp` | 端点信息；带 `Accept: text/event-stream` 走 SSE 流；也支持 `?method=` 直接调用 |
+| `DELETE` | `/mcp` | 405（本服务无协议级会话） |
+| `ALL` | `/api/mcp/info` | 端点信息、协议版本、工具 / 资源 / 提示清单 |
+
+暴露 16 个工具（`host_list`、`pty_create`、`pty_write`、`pty_read`、`exec`、`fs_upload`、`security_check` …）、6 类 `pty://` 资源与 2 个提示。
+
+接进 Claude Desktop / Cursor：
+
+```json
+{
+  "mcpServers": {
+    "pty2": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://ai.pty2.<clientId>.html.dtns.top/mcp"]
+    }
+  }
+}
+```
+
+安全策略默认保守：`warn` 级命令放行、`danger` 级默认拒绝、可开只读模式（禁用 `exec` / `pty_write` / `fs_upload` / `fs_delete`）、可设 Bearer Token、默认 240 次/分 + 4 并发限流，所有调用写入面板日志。完整说明见 [`client/MCP-使用说明.md`](client/MCP-使用说明.md)。
+
+#### 6.2 机器可读 API 说明：`/agent.json` · `/api.json`
+
+Agent URL 下直接返回结构化接口文档（schema `pty-agent-api/1`，含全部路由、参数、请求响应示例、错误码与 quickstart），调用方不必依赖人类文档：
+
+```bash
+curl http://ai.pty2.<clientId>.html.dtns.top/agent.json
+```
+
+- `client/agent.json` 是**单一数据源**，`client/api.json` 与 `client/js/agent-doc.js`（页面内嵌副本）由 `node client/tools/build-agent-doc.js` 生成，改文档只改 `agent.json`。
+- 即使静态文件未部署，路由也会用内嵌副本兜底，并注入运行时 `baseUrl` / `clientId` / MCP 端点。
 
 ---
 
@@ -306,7 +347,14 @@ await client.exec('uname -a');    // 一次性命令
 ├── client/                     # 前端 SDK（ibbot-pty-sdk）
 │   ├── src/                    # ES Module 源码
 │   ├── dist/                   # 构建产物（UMD / ESM / CJS + d.ts）
-│   ├── js/                     # 独立 Agent 脚本（sdk.js / pty-agent / pty2-agent）
+│   ├── js/                     # 独立脚本：sdk / pty-agent / pty2-agent / mcp-server / agent-doc
+│   ├── agent.json              # 机器可读 API 说明（单一数据源）
+│   ├── api.json                # agent.json 的完整副本（生成物）
+│   ├── tools/
+│   │   └── build-agent-doc.js  # 由 agent.json 生成 api.json 与 js/agent-doc.js
+│   ├── test/
+│   │   └── mcp-smoke.js        # MCP + agent.json 冒烟测试（45 项，无外部依赖）
+│   ├── MCP-使用说明.md          # MCP 端点、工具清单、安全策略、客户端配置
 │   ├── demo-hosts.html         # 演示面板（唯一发布的静态文件）
 │   ├── node-demo.js            # Node.js 用法示例
 │   ├── package.json
@@ -343,6 +391,9 @@ await client.exec('uname -a');    // 一次性命令
 **Q：能多用户吗？**
 不能。当前是单密钥模型，没有账号体系。多用户请用 ShellHub / Teleport。
 
+**Q：MCP 端点和 HTTP API 是两套实现吗？**
+一套。`js/mcp-server.js` 只是把 `js/pty2-agent.js` 已有的 HTTP 能力按 MCP 协议包装（工具内部调用同一批处理函数），所以权限、限流、审计、只读模式对两边同时生效。
+
 **Q：商用可以吗？**
 GPLv3。可以商用，但分发或提供修改版服务时需按 GPLv3 开源你的修改。
 
@@ -354,7 +405,8 @@ GPLv3。可以商用，但分发或提供修改版服务时需按 GPLv3 开源�
 
 1. 没有把真实 `secret_key`、`server-id`、私钥路径带进提交；
 2. 新增静态文件需说明用途后一并评审；
-3. 改动涉及协议时，同步更新 `server/src/tunnel/README.md` 与本文接口章节。
+3. 改动涉及协议时，同步更新 `server/src/tunnel/README.md` 与本文接口章节；
+4. 改动 HTTP API 时只改 `client/agent.json`，再执行 `node client/tools/build-agent-doc.js` 生成 `api.json` 与 `js/agent-doc.js`（不要手改生成物），最后跑 `npm test`。
 
 ---
 
@@ -371,3 +423,5 @@ GPLv3。可以商用，但分发或提供修改版服务时需按 GPLv3 开源�
 |---|---|---|
 | v1.0.0 | 2026-10-27 | 首次开源发布并同步至 Gitee 与 GitHub；许可证 GPLv3 |
 | v1.0.1 | 2026-10-27 | README 重写：补充同类项目对比、差异化竞争点、适用边界、完整接口与配置说明；配置模板对齐代码字段 |
+| v1.1.0 | 2026-10-29 | 新增 MCP 端点：`js/mcp-server.js` 实现 MCP Streamable HTTP（含 16 工具 / 6 资源 / 2 提示、Token、只读模式、限流、确认闸门），`pty2-agent.js` 挂载 `/mcp` 与 `/api/mcp/info`，附 `MCP-使用说明.md` 与 `test/mcp-smoke.js` |
+| v1.1.0 | 2026-10-29 | 新增机器可读 API 说明 `agent.json` / `api.json` 及生成工具 `tools/build-agent-doc.js`；Agent 域名下可直接 `GET /agent.json`、`GET /api.json` 自助接入 |
