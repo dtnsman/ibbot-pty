@@ -1,0 +1,647 @@
+{
+  "ok": true,
+  "schema": "pty-agent-api/1",
+  "name": "PTY Agent HTTP API",
+  "service": "pty-agent",
+  "version": "2.1.0",
+  "sdkVersion": "2.0.0",
+  "description": "IBBot PTY Manager v2 把浏览器里已连接的本地 / SSH 终端，通过 DTNS 隧道暴露成标准 HTTP API + WebSocket 实时流 + MCP 端点。HTTP-API 调用方（脚本、Agent、LLM 工具）只需 GET/POST 即可读写终端、执行命令、传输文件。",
+  "baseUrl": "http://ai.pty2.<clientId>.html.dtns.top",
+  "baseUrlTemplate": true,
+  "baseUrlNote": "实际 baseUrl 见页面「🤖 Agent」面板的 Agent URL，或直接 GET /api/info 的 apiBase 字段；本文档由服务端返回时 baseUrl 会被替换为真实地址。",
+  "discovery": {
+    "index": "/",
+    "routes": "/api/routes",
+    "info": "/api/info",
+    "health": "/health",
+    "agentJson": "/agent.json",
+    "apiJson": "/api.json",
+    "mcpInfo": "/api/mcp/info",
+    "mcpEndpoint": "/mcp",
+    "websocket": "/api/pty/stream"
+  },
+  "conventions": {
+    "methods": "所有 /api/* 路由都接受任意 HTTP 方法（GET / POST / PUT / PATCH / DELETE / HEAD），OPTIONS 预检固定返回 204。文档里标注的方法只是推荐用法。",
+    "params": "参数可以放在 query string、JSON body 或 form body 中；同一个 key 同时出现时 query 优先级最高。",
+    "successEnvelope": "{ \"success\": true, ...业务字段 }",
+    "errorEnvelope": "{ \"success\": false, \"error\": \"错误描述\", ...补充字段 }",
+    "cors": "响应头固定 Access-Control-Allow-Origin: *，浏览器端可直接跨域调用。",
+    "auth": "HTTP API 默认无鉴权（依赖隧道域名不可猜测）；仅 MCP 端点在面板设置 mcpToken 后要求 Authorization: Bearer <token>。",
+    "hostId": "省略 hostId 时自动取「第一个已连接的主机」，都未连接时取页面主机列表的第一个。",
+    "durationHeader": "每个响应都带 x-pty-agent-duration（毫秒，服务端处理耗时）。",
+    "currentTerm": "termId 省略时大多使用当前激活终端（rt.activeTermId）。",
+    "prerequisites": "调用前页面需处于打开状态，且「🤖 Agent」面板已启动（服务未启动时隧道域名不可达）。"
+  },
+  "quickstart": [
+    {
+      "step": 1,
+      "title": "看端点索引（最快确认服务在线）",
+      "request": "curl http://ai.pty2.<clientId>.html.dtns.top/"
+    },
+    {
+      "step": 2,
+      "title": "健康检查 / 隧道与 MCP 状态",
+      "request": "curl http://ai.pty2.<clientId>.html.dtns.top/health"
+    },
+    {
+      "step": 3,
+      "title": "最常用：执行一条命令",
+      "request": "curl -X POST http://ai.pty2.<clientId>.html.dtns.top/api/exec -H 'Content-Type: application/json' -d '{\"command\":\"uname -a && whoami\"}'"
+    },
+    {
+      "step": 4,
+      "title": "新建一个 Agent 终端 → 写入 → 读取",
+      "request": "curl -X POST .../api/pty/create -d '{\"backend\":\"local\",\"cols\":100,\"rows\":30}'\ncurl -X POST .../api/pty/write -d '{\"termId\":\"<termId>\",\"data\":\"ls -al\",\"enter\":true}'\ncurl '.../api/pty/read?termId=<termId>&lines=50'"
+    },
+    {
+      "step": 5,
+      "title": "订阅实时输出（WebSocket）",
+      "request": "ws://ai.pty2.<clientId>.html.dtns.top/api/pty/stream?termId=<termId>&lines=50"
+    },
+    {
+      "step": 6,
+      "title": "给支持 MCP 的客户端直接接入",
+      "request": "端点 http://ai.pty2.<clientId>.html.dtns.top/mcp（Streamable HTTP）"
+    }
+  ],
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/",
+      "summary": "服务信息与端点索引",
+      "description": "返回服务名、版本、域名、apiBase 以及全部路由清单。排查「服务是否通」的第一站。",
+      "params": [],
+      "responseExample": {
+        "ok": true,
+        "service": "pty-agent",
+        "version": "2.1.0",
+        "sdkVersion": "2.0.0",
+        "clientId": "<clientId>",
+        "domain": "ai.pty2.<clientId>.html.dtns.top",
+        "apiBase": "http://ai.pty2.<clientId>.html.dtns.top",
+        "allowDanger": false,
+        "endpoints": [
+          { "method": "ALL", "path": "/api/info", "desc": "能力、域名与主机信息" }
+        ]
+      },
+      "errors": []
+    },
+    {
+      "method": "GET",
+      "path": "/health",
+      "summary": "健康检查",
+      "description": "隧道连接状态、请求计数、运行时长与 MCP 统计。",
+      "params": [],
+      "responseExample": {
+        "status": "ok",
+        "service": "pty-agent",
+        "version": "2.1.0",
+        "sdkVersion": "2.0.0",
+        "clientId": "<clientId>",
+        "domain": "ai.pty2.<clientId>.html.dtns.top",
+        "apiBase": "http://ai.pty2.<clientId>.html.dtns.top",
+        "enabled": true,
+        "connected": true,
+        "registered": true,
+        "requests": 12,
+        "errors": 0,
+        "uptimeMs": 93000,
+        "mcp": {
+          "enabled": true,
+          "requests": 3,
+          "errors": 0,
+          "denied": 0,
+          "toolCalls": 2,
+          "active": 0,
+          "tools": 16,
+          "resources": 4,
+          "prompts": 2,
+          "uptimeMs": 92000,
+          "toolCounts": { "exec": 2 },
+          "recent": []
+        },
+        "timestamp": "2026-10-29T01:27:09.000Z"
+      },
+      "errors": []
+    },
+    {
+      "method": "GET",
+      "path": "/api/info",
+      "summary": "能力、域名与主机信息",
+      "description": "列出 capabilities、默认主机 defaultHostId、页面配置的主机列表、MCP 端点与协议版本、全部路由。Agent 首次接入建议先读它。",
+      "params": [],
+      "responseExample": {
+        "success": true,
+        "name": "PTY Agent Service",
+        "version": "2.1.0",
+        "sdkVersion": "2.0.0",
+        "clientId": "<clientId>",
+        "domain": "ai.pty2.<clientId>.html.dtns.top",
+        "apiBase": "http://ai.pty2.<clientId>.html.dtns.top",
+        "defaultHostId": "<hostId>",
+        "allowDanger": false,
+        "capabilities": [
+          "pty_create", "pty_write", "pty_read", "pty_resize", "pty_destroy", "pty_list", "pty_stream",
+          "exec_local", "exec_ssh",
+          "fs_list", "fs_download", "fs_download_raw", "fs_upload", "fs_upload_raw", "fs_delete",
+          "ai_context", "security_check",
+          "mcp", "mcp_tools", "mcp_resources", "mcp_prompts"
+        ],
+        "mcp": {
+          "enabled": true,
+          "endpoint": "http://ai.pty2.<clientId>.html.dtns.top/mcp",
+          "transport": "streamable-http",
+          "protocolVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
+          "tools": 16
+        },
+        "hosts": [
+          { "id": "<hostId>", "name": "本机 (local)", "url": "wss://res2.dtns.top/tunnel" }
+        ],
+        "routes": [
+          { "method": "ALL", "path": "/api/exec", "desc": "执行一次性命令（local / ssh）" }
+        ]
+      },
+      "errors": []
+    },
+    {
+      "method": "GET",
+      "path": "/api/routes",
+      "summary": "路由列表",
+      "description": "只返回 method / path / desc 三元组，适合做能力探测。",
+      "params": [],
+      "responseExample": {
+        "success": true,
+        "routes": [
+          { "method": "ALL", "path": "/api/pty/list", "desc": "终端列表" }
+        ]
+      },
+      "errors": []
+    },
+    {
+      "method": "GET",
+      "path": "/agent.json",
+      "summary": "机器可读的 API 说明（本文档）",
+      "description": "返回当前这份文档；服务端会把 baseUrl / service.clientId 等字段替换为运行时真实值。api.json 是它的完整副本，两者内容一致。",
+      "params": [],
+      "responseExample": { "ok": true, "schema": "pty-agent-api/1", "endpoints": [] },
+      "errors": []
+    },
+    {
+      "method": "GET",
+      "path": "/api.json",
+      "summary": "API 说明副本（与 agent.json 完全相同）",
+      "description": "给「按 api.json 约定取说明」的客户端使用，内容与 /agent.json 一致。",
+      "params": [],
+      "responseExample": { "ok": true, "schema": "pty-agent-api/1", "endpoints": [] },
+      "errors": []
+    },
+    {
+      "method": "GET",
+      "path": "/api/mcp/info",
+      "summary": "MCP 端点信息与工具清单",
+      "description": "返回 MCP 版本、协议版本、传输方式、tools/resources/prompts 全量 schema。",
+      "params": [],
+      "responseExample": {
+        "success": true,
+        "name": "pty-agent MCP",
+        "version": "2.1.0",
+        "enabled": true,
+        "readOnly": false,
+        "endpoint": "http://ai.pty2.<clientId>.html.dtns.top/mcp",
+        "protocolVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
+        "transport": {
+          "type": "streamable-http",
+          "methods": ["POST", "GET", "DELETE"],
+          "responseModes": ["application/json", "text/event-stream"]
+        },
+        "capabilities": {
+          "tools": { "count": 16, "listChanged": false },
+          "resources": { "count": 4, "subscribe": false, "listChanged": false },
+          "prompts": { "count": 2, "listChanged": false }
+        },
+        "tools": []
+      },
+      "errors": []
+    },
+    {
+      "method": "GET",
+      "path": "/api/hosts/list",
+      "summary": "主机列表",
+      "description": "列出页面中配置的所有主机及连接状态、终端数量。",
+      "params": [],
+      "responseExample": {
+        "success": true,
+        "hosts": [
+          {
+            "id": "<hostId>",
+            "name": "本机 (local)",
+            "url": "wss://res2.dtns.top/tunnel",
+            "inRuntime": true,
+            "connected": true,
+            "clientConnected": true,
+            "terminalCount": 2,
+            "uiTerminals": 1,
+            "agentTerminals": 1
+          }
+        ]
+      },
+      "errors": []
+    },
+    {
+      "method": "GET",
+      "path": "/api/hosts/status",
+      "summary": "主机状态",
+      "description": "单个主机的详细状态：连接、终端数、可选 backend 与 shell 列表。",
+      "params": [
+        { "name": "hostId", "in": "query", "type": "string", "required": true, "description": "主机 id" }
+      ],
+      "requestExample": "GET /api/hosts/status?hostId=<hostId>",
+      "responseExample": {
+        "success": true,
+        "hostId": "<hostId>",
+        "inRuntime": true,
+        "connected": true,
+        "clientConnected": true,
+        "terminalCount": 2,
+        "uiTerminals": 1,
+        "agentTerminals": 1,
+        "activeTermId": "<termId>",
+        "backends": ["local", "ssh"],
+        "shells": [{ "id": "bash", "name": "bash" }]
+      },
+      "errors": [
+        { "status": 400, "error": "hostId is required" },
+        { "status": 404, "error": "host not found" }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/pty/list",
+      "summary": "终端列表",
+      "description": "列出该主机上的终端，区分页面 UI 终端（inUI）与 Agent 创建的终端（agent）。",
+      "params": [
+        { "name": "hostId", "in": "query", "type": "string", "required": false, "description": "省略时取已连接主机" }
+      ],
+      "responseExample": {
+        "success": true,
+        "hostId": "<hostId>",
+        "activeTermId": "<termId>",
+        "terminals": [
+          { "termId": "<termId>", "backend": "local", "exited": false, "active": true, "inUI": true, "agent": false },
+          { "termId": "<termId2>", "backend": "local", "exited": false, "code": null, "active": false, "inUI": false, "agent": true }
+        ]
+      },
+      "errors": [
+        { "status": 503, "error": "host not connected" }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/pty/create",
+      "summary": "新建终端（Agent 专用，不占用页面 UI）",
+      "description": "在指定主机上创建一个不显示在页面 tab 里的终端，返回 termId，供后续 write/read/stream 使用。主机未连接时会尝试自动连接。",
+      "params": [
+        { "name": "hostId", "in": "body", "type": "string", "required": false, "description": "主机 id，省略时取已连接主机" },
+        { "name": "backend", "in": "body", "type": "string", "required": false, "default": "local", "enum": ["local", "ssh"], "description": "local=本机 pty；ssh=远程主机" },
+        { "name": "shellId", "in": "body", "type": "string", "required": false, "description": "shell id（local 用 shellId，ssh 用 remoteShell）" },
+        { "name": "cols", "in": "body", "type": "integer", "required": false, "default": 80, "description": "列数" },
+        { "name": "rows", "in": "body", "type": "integer", "required": false, "default": 24, "description": "行数" },
+        { "name": "cwd", "in": "body", "type": "string", "required": false, "description": "初始工作目录" }
+      ],
+      "requestExample": "curl -X POST .../api/pty/create -H 'Content-Type: application/json' -d '{\"backend\":\"local\",\"cols\":100,\"rows\":30,\"cwd\":\"/tmp\"}'",
+      "responseExample": {
+        "success": true,
+        "hostId": "<hostId>",
+        "termId": "<termId>",
+        "backend": "local",
+        "shellId": null,
+        "cols": 100,
+        "rows": 30,
+        "session": "agent",
+        "hint": "用 /api/pty/read 读取输出，/api/pty/write 写入，/api/pty/stream 订阅实时输出"
+      },
+      "errors": [
+        { "status": 404, "error": "host not found" },
+        { "status": 503, "error": "host not connected" },
+        { "status": 503, "error": "failed to connect: <msg>" },
+        { "status": 500, "error": "<底层 createTerminal 异常>" }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/pty/write",
+      "summary": "写入终端",
+      "description": "把文本/按键写入 PTY。enter=true 时自动追加回车 \\r，等价于「敲命令并执行」。中文等多字节内容建议用 dataBase64。",
+      "params": [
+        { "name": "termId", "in": "body", "type": "string", "required": true, "description": "终端 id" },
+        { "name": "data", "in": "body", "type": "string", "required": false, "description": "要写入的文本（与 dataBase64 二选一）" },
+        { "name": "dataBase64", "in": "body", "type": "string", "required": false, "description": "base64 编码的写入内容（二进制安全）" },
+        { "name": "enter", "in": "body", "type": "boolean", "required": false, "default": false, "description": "是否追加回车" }
+      ],
+      "requestExample": "curl -X POST .../api/pty/write -H 'Content-Type: application/json' -d '{\"termId\":\"<termId>\",\"data\":\"ls -al\",\"enter\":true}'",
+      "responseExample": { "success": true, "termId": "<termId>", "bytesWritten": 7 },
+      "errors": [
+        { "status": 400, "error": "termId is required" },
+        { "status": 400, "error": "data or dataBase64 is required" },
+        { "status": 503, "error": "host not connected" },
+        { "status": 500, "error": "<write 异常>" }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/pty/read",
+      "summary": "读取终端最近输出",
+      "description": "读取终端缓冲区最近 lines 行（已去除 ANSI 转义）。同时返回纯文本 text 与 base64 版本。实时输出建议改用 WebSocket。",
+      "params": [
+        { "name": "termId", "in": "query", "type": "string", "required": false, "description": "终端 id，省略时取当前激活终端" },
+        { "name": "lines", "in": "query", "type": "integer", "required": false, "default": 50, "min": 1, "max": 5000, "description": "读取行数" }
+      ],
+      "requestExample": "GET /api/pty/read?termId=<termId>&lines=50",
+      "responseExample": {
+        "success": true,
+        "termId": "<termId>",
+        "seq": 1761701229000,
+        "lines": ["$ uname -a", "Linux host 6.1.0 x86_64 GNU/Linux"],
+        "text": "$ uname -a\nLinux host 6.1.0 x86_64 GNU/Linux",
+        "dataBase64": "JCB1bmFtZSAtYQpMaW51eCBob3N0...",
+        "agent": true,
+        "exited": false
+      },
+      "errors": [
+        { "status": 503, "error": "host not connected" },
+        { "status": 400, "error": "termId is required" },
+        { "status": 404, "error": "term not bound in this host" }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/pty/resize",
+      "summary": "调整终端尺寸",
+      "description": "调整 cols / rows；对页面 UI 终端会同时触发表格自适应。",
+      "params": [
+        { "name": "termId", "in": "body", "type": "string", "required": true, "description": "终端 id" },
+        { "name": "cols", "in": "body", "type": "integer", "required": false, "default": 80, "description": "列数" },
+        { "name": "rows", "in": "body", "type": "integer", "required": false, "default": 24, "description": "行数" }
+      ],
+      "responseExample": { "success": true, "termId": "<termId>", "cols": 120, "rows": 40 },
+      "errors": [
+        { "status": 400, "error": "termId is required" },
+        { "status": 503, "error": "host not connected" },
+        { "status": 500, "error": "<resize 异常>" }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/pty/destroy",
+      "summary": "销毁终端",
+      "description": "销毁终端。页面 UI 终端会交给页面关闭（释放 xterm / tab / 服务端会话）；Agent 终端直接销毁。",
+      "params": [
+        { "name": "termId", "in": "body", "type": "string", "required": true, "description": "终端 id" },
+        { "name": "hostId", "in": "body", "type": "string", "required": false, "description": "主机 id，省略时取已连接主机" }
+      ],
+      "responseExample": { "success": true, "termId": "<termId>" },
+      "errors": [
+        { "status": 400, "error": "termId is required" },
+        { "status": 503, "error": "host not connected" },
+        { "status": 500, "error": "<destroy 异常>" }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/exec",
+      "summary": "执行一次性命令（local / ssh）",
+      "description": "最小白名单机制的命令执行入口，返回 stdout / stderr / exitCode。默认超时 60s，最长 300s。危险命令（rm -rf /、dd 写块设备、mkfs 等）默认 403；warn 级命令（rm -r、shutdown、命令替换等）需要 confirm=true。适用于「一次性取结果」，交互式场景请用 pty/create + write/read。",
+      "params": [
+        { "name": "command", "in": "body", "type": "string", "required": true, "description": "要执行的 shell 命令" },
+        { "name": "hostId", "in": "body", "type": "string", "required": false, "description": "目标主机 id" },
+        { "name": "useSsh", "in": "body", "type": "boolean", "required": false, "default": false, "description": "是否走 SSH 通道执行" },
+        { "name": "timeout", "in": "body", "type": "integer", "required": false, "default": 60000, "description": "超时毫秒（建议 ≤300000）" },
+        { "name": "confirm", "in": "body", "type": "boolean", "required": false, "default": false, "description": "warn 级命令确认执行；对 danger 级等同 force" },
+        { "name": "force", "in": "body", "type": "boolean", "required": false, "default": false, "description": "confirm 的别名" }
+      ],
+      "requestExample": "curl -X POST .../api/exec -H 'Content-Type: application/json' -d '{\"command\":\"uname -a && whoami\",\"timeout\":30000}'",
+      "responseExample": {
+        "success": true,
+        "stdout": "Linux host 6.1.0 x86_64 GNU/Linux\nroot\n",
+        "stderr": "",
+        "exitCode": 0,
+        "duration": 128,
+        "command": "uname -a && whoami",
+        "useSsh": false,
+        "risk": "safe"
+      },
+      "errors": [
+        { "status": 400, "error": "command is required" },
+        { "status": 403, "error": "危险命令，默认禁止", "extra": { "reason": "rm 删除根目录", "risk": "danger", "needConfirm": true } },
+        { "status": 403, "error": "命令需要确认", "extra": { "reason": "未在白名单中，需要确认", "risk": "warn", "needConfirm": true } },
+        { "status": 503, "error": "host not connected" },
+        { "status": 500, "error": "<exec 异常>" }
+      ],
+      "notes": "risk 取值：safe / warn / danger。页面「🤖 Agent」面板勾选「允许 danger 级命令」后，danger 级可无 confirm 直接执行。"
+    },
+    {
+      "method": "GET",
+      "path": "/api/fs/list",
+      "summary": "文件列表",
+      "description": "列出当前主机的工作目录文件（服务端返回的原始结构）。",
+      "params": [
+        { "name": "hostId", "in": "query", "type": "string", "required": false, "description": "主机 id" }
+      ],
+      "responseExample": {
+        "success": true,
+        "hostId": "<hostId>",
+        "files": [{ "name": "a.txt", "size": 12, "isDir": false }]
+      },
+      "errors": [
+        { "status": 503, "error": "host not connected" },
+        { "status": 500, "error": "<listFiles 异常>" }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/fs/download",
+      "summary": "下载文件（JSON base64 或 raw 二进制）",
+      "description": "默认返回 JSON + dataBase64；带 raw=1（或 download=1）时返回 application/octet-stream 二进制，并带 Content-Disposition: attachment。",
+      "params": [
+        { "name": "name", "in": "query", "type": "string", "required": true, "description": "文件名 / 相对路径" },
+        { "name": "hostId", "in": "query", "type": "string", "required": false, "description": "主机 id" },
+        { "name": "raw", "in": "query", "type": "boolean", "required": false, "default": false, "description": "1=直接返回二进制" },
+        { "name": "download", "in": "query", "type": "boolean", "required": false, "default": false, "description": "raw 的别名" }
+      ],
+      "requestExample": "curl -o a.txt '.../api/fs/download?name=a.txt&raw=1'",
+      "responseExample": { "success": true, "hostId": "<hostId>", "name": "a.txt", "size": 12, "dataBase64": "aGVsbG8gd29ybGQK" },
+      "errors": [
+        { "status": 400, "error": "name is required" },
+        { "status": 501, "error": "downloadFileToBytes 未实现，请升级 PtyClient" },
+        { "status": 503, "error": "host not connected" },
+        { "status": 500, "error": "<download 异常>" }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/fs/upload",
+      "summary": "上传文件（JSON base64 或原始二进制 body）",
+      "description": "两种用法：① JSON 提交 {\"name\":\"a.txt\",\"rel\":\"dir/a.txt\",\"dataBase64\":\"...\"}；② 原始二进制 body + Content-Type: application/octet-stream，文件名走 ?name= 或 X-Filename 头，相对路径走 ?rel= 或 X-Rel-Path 头。单请求体上限 32MB。",
+      "params": [
+        { "name": "name", "in": "query", "type": "string", "required": false, "description": "文件名（缺失时读 X-Filename，仍缺失则自动生成 upload-<ts>.bin）" },
+        { "name": "rel", "in": "query", "type": "string", "required": false, "description": "相对路径（缺失时读 X-Rel-Path，默认等于 name）" },
+        { "name": "dataBase64", "in": "body", "type": "string", "required": false, "description": "base64 内容（JSON 上传时必填）" },
+        { "name": "hostId", "in": "query", "type": "string", "required": false, "description": "主机 id" }
+      ],
+      "requestExample": "curl -X POST '.../api/fs/upload?name=a.txt&rel=a.txt' -H 'Content-Type: application/octet-stream' --data-binary @a.txt",
+      "responseExample": { "success": true, "name": "a.txt", "rel": "a.txt", "size": 12, "mode": "raw" },
+      "errors": [
+        { "status": 400, "error": "dataBase64 is required for JSON upload" },
+        { "status": 400, "error": "dataBase64 or raw request body is required" },
+        { "status": 400, "error": "invalid dataBase64" },
+        { "status": 503, "error": "host not connected" },
+        { "status": 500, "error": "<upload 异常>" }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/fs/delete",
+      "summary": "删除文件",
+      "description": "删除主机上的文件（不可恢复，调用前请自行校验路径）。",
+      "params": [
+        { "name": "name", "in": "body", "type": "string", "required": true, "description": "文件名 / 相对路径" },
+        { "name": "hostId", "in": "body", "type": "string", "required": false, "description": "主机 id" }
+      ],
+      "responseExample": { "success": true, "name": "a.txt" },
+      "errors": [
+        { "status": 400, "error": "name is required" },
+        { "status": 503, "error": "host not connected" },
+        { "status": 500, "error": "<delete 异常>" }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/ai/context",
+      "summary": "AI 上下文（最近输出 / 最后命令 / cwd）",
+      "description": "给 LLM 用的聚合视图：最近 lines 行输出 + 从提示符推断的最后命令与当前目录。",
+      "params": [
+        { "name": "termId", "in": "query", "type": "string", "required": false, "description": "终端 id，省略时取当前激活终端" },
+        { "name": "lines", "in": "query", "type": "integer", "required": false, "default": 50, "min": 1, "max": 5000, "description": "上下文行数" },
+        { "name": "hostId", "in": "query", "type": "string", "required": false, "description": "主机 id" }
+      ],
+      "responseExample": {
+        "success": true,
+        "hostId": "<hostId>",
+        "termId": "<termId>",
+        "recentOutput": "$ ls -al\ntotal 8\n",
+        "lines": 2,
+        "lastCommand": "ls -al",
+        "cwd": "/root",
+        "exitCode": null
+      },
+      "errors": [
+        { "status": 404, "error": "host not found" },
+        { "status": 404, "error": "no active term" },
+        { "status": 404, "error": "term not bound in this host" }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/security/check",
+      "summary": "命令安全检查",
+      "description": "只做判定不执行：返回 safe / risk / reason / matched，可在真正调用 /api/exec 前预检。",
+      "params": [
+        { "name": "command", "in": "query", "type": "string", "required": true, "description": "待检查的命令" }
+      ],
+      "requestExample": "curl -G '.../api/security/check' --data-urlencode 'command=rm -rf /'",
+      "responseExample": {
+        "success": true,
+        "command": "rm -rf /",
+        "safe": false,
+        "risk": "danger",
+        "reason": "rm 删除根目录",
+        "matched": "/rm\\s+(-[a-zA-Z]*[rf][a-zA-Z]*\\s+)*\\/(\\s|$)/"
+      },
+      "errors": [
+        { "status": 400, "error": "command is required" }
+      ]
+    }
+  ],
+  "websocket": {
+    "path": "/api/pty/stream",
+    "url": "ws://ai.pty2.<clientId>.html.dtns.top/api/pty/stream?termId=<termId>&lines=50",
+    "protocol": "cdtty-ws/1",
+    "params": [
+      { "name": "termId", "in": "query", "type": "string", "required": false, "description": "省略时取当前激活终端" },
+      { "name": "lines", "in": "query", "type": "integer", "required": false, "default": 0, "description": "连接后回放的历史行数（>0 才推 snapshot）" },
+      { "name": "hostId", "in": "query", "type": "string", "required": false, "description": "主机 id" }
+    ],
+    "serverToClient": [
+      { "type": "ready", "example": { "type": "ready", "termId": "<termId>", "hostId": "<hostId>", "backend": "local", "inUI": true, "agent": false, "cols": 100, "rows": 30, "protocol": "cdtty-ws/1" } },
+      { "type": "snapshot", "example": { "type": "snapshot", "termId": "<termId>", "lines": ["$ ls"] } },
+      { "type": "data", "example": { "type": "data", "termId": "<termId>", "data": "终端输出增量" } },
+      { "type": "exit", "example": { "type": "exit", "termId": "<termId>", "code": 0, "signal": null, "error": null } },
+      { "type": "pong", "example": { "type": "pong", "t": 1761701229000 } },
+      { "type": "error", "example": { "type": "error", "error": "unknown message type: xxx" } }
+    ],
+    "clientToServer": [
+      { "type": "input", "example": { "type": "input", "data": "ls -al", "enter": true } },
+      { "type": "write", "example": { "type": "write", "data": "\\u0003" }, "note": "input 的别名" },
+      { "type": "resize", "example": { "type": "resize", "cols": 120, "rows": 40 } },
+      { "type": "read", "example": { "type": "read", "lines": 100 } },
+      { "type": "ping", "example": { "type": "ping" } }
+    ],
+    "notes": [
+      "终端退出时服务端先发 exit 再以 1000 关闭连接。",
+      "二进制帧不支持，只接受 JSON 文本帧。",
+      "非 JSON 文本帧会被当作原始键盘输入直接写入 PTY。",
+      "失败场景：host 未连接 / termId 缺失 → 1011 + {type:'error'}。"
+    ]
+  },
+  "mcp": {
+    "endpoint": "/mcp",
+    "transport": "streamable-http",
+    "methods": ["POST", "GET", "DELETE"],
+    "protocolVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
+    "auth": "面板设置 mcpToken 后，请求需带 Authorization: Bearer <token>。",
+    "modernHeaders": ["MCP-Protocol-Version", "Mcp-Method", "Mcp-Name"],
+    "tools": [
+      "host_list", "host_status", "pty_list", "pty_create", "pty_write", "pty_read", "pty_resize", "pty_destroy",
+      "exec", "fs_list", "fs_download", "fs_upload", "fs_delete", "ai_context", "security_check", "service_info"
+    ],
+    "clientConfig": {
+      "mcpServers": {
+        "pty2": {
+          "command": "npx",
+          "args": ["-y", "mcp-remote", "http://ai.pty2.<clientId>.html.dtns.top/mcp"]
+        }
+      }
+    },
+    "notes": [
+      "GET /mcp 返回端点信息；带 Accept: text/event-stream 时走 SSE。",
+      "POST /mcp 支持 application/json 与 text/event-stream 两种响应模式，不支持 JSON-RPC 批处理。",
+      "DELETE /mcp 固定 405（本服务无协议级会话）。",
+      "面板可开启「只读模式」「写/执行前需页面确认」「允许 danger 级命令」等策略。"
+    ]
+  },
+  "constants": {
+    "maxReadLines": 5000,
+    "defaultReadLines": 50,
+    "maxRequestBodyMB": 32,
+    "terminalBufferKB": 256,
+    "defaultExecTimeoutMs": 60000,
+    "riskLevels": ["safe", "warn", "danger"],
+    "wsProtocol": "cdtty-ws/1",
+    "durationHeader": "x-pty-agent-duration"
+  },
+  "errors": {
+    "400": "参数缺失或格式错误（看 error 字段）",
+    "403": "命令被安全检查拦截，返回 risk / reason / needConfirm，可传 confirm=true",
+    "404": "路由或资源不存在；term 不属于当前主机时也返回 404",
+    "405": "MCP DELETE；error=method_not_allowed",
+    "500": "底层 PTY / 文件操作异常",
+    "501": "能力未实现（如客户端版本过旧缺失 downloadFileToBytes）",
+    "503": "主机未连接（先 /api/pty/create 或页面点击新建终端）",
+    "unknownRoute": "{ success:false, error:'Route not found: <METHOD> <path>', availableRoutes:[...] }"
+  },
+  "related": {
+    "demoPage": "demo-pty2-agent.html",
+    "mcpGuide": "MCP-使用说明.md",
+    "releaseNotes": "发布说明.md"
+  }
+}
