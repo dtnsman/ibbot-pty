@@ -5,6 +5,8 @@
 > ttyd / GoTTY 把「一条命令」挂到网页；ShellHub / Teleport 解决「企业级设备接入与审计」；
 > 本项目解决另一件事——**人和 AI 怎么随手够到一堆机器，并且把终端能力嵌进自己的系统里**。
 
+🔗 **在线体验**：<http://cases.html.dtns.top/pty2.html> —— 纯浏览器打开即用，不用装任何东西（示例主机由公开演示服务提供，请勿用于生产）。
+
 ---
 
 ## 一、它解决什么痛点
@@ -266,6 +268,8 @@ npm run build      # 重建 dist（需要改源码时）
 
 直接用浏览器打开 `client/demo-hosts.html`；xterm.js 走 CDN，本地只依赖 `dist/ibbot-pty.umd.js`。
 
+不想先装环境？用在线体验页 <http://cases.html.dtns.top/pty2.html> 先看面板长什么样，页面结构与 `client/demo-hosts.html` 一致。
+
 首次使用点「🖥️ 设备管理」→ 填入 `ws://127.0.0.1:10310` 与 `secret_key` → 保存 → 「新建终端」。
 
 ---
@@ -459,6 +463,7 @@ GPLv3。可以商用，但分发或提供修改版服务时需按 GPLv3 开源�
 
 - Gitee：https://gitee.com/dtnsman/ibbot-pty
 - GitHub：https://github.com/dtnsman/ibbot-pty
+- 在线体验：http://cases.html.dtns.top/pty2.html
 
 ### 发布纪录
 
