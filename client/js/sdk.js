@@ -348,6 +348,48 @@
     return encodeFrame('websocket_close', payload, VERSION, 0);
   }
 
+  // ==================== SSE (client -> server) ====================
+  // 旧 SSE 旁路：sseRequestId 由中继在 handleSSERequest() 中生成，
+  // 客户端通过 sse_data / sse_end 帧把事件推回浏览器。
+
+  function encodeSSEData(fields) {
+    var data = typeof fields.data === 'string'
+      ? utf8(fields.data)
+      : utf8(JSON.stringify(fields.data === undefined ? '' : fields.data));
+    var payload = concat([
+      encodeString(fields.sseRequestId || ''),
+      encodeBuffer(data),
+      encodeString(fields.event || ''),
+      encodeString(fields.id || ''),
+      u8(fields.retry || 0),
+      encodeString(fields.timestamp || new Date().toISOString())
+    ]);
+    return encodeFrame('sse_data', payload, VERSION, 0);
+  }
+
+  function encodeSSEEnd(fields) {
+    // 服务端没有 sse_end 专用解码器，走通用 JSON（u32 长度 + JSON）。
+    return encodeFrame('sse_end', encodeGeneric({
+      type: 'sse_end',
+      sseRequestId: fields.sseRequestId || '',
+      timestamp: fields.timestamp || new Date().toISOString()
+    }), VERSION, 0);
+  }
+
+  function encodeSSEError(fields) {
+    return encodeFrame('sse_error', encodeGeneric({
+      type: 'sse_error',
+      sseRequestId: fields.sseRequestId || '',
+      error: fields.error || '',
+      timestamp: fields.timestamp || new Date().toISOString()
+    }), VERSION, 0);
+  }
+
+  function encodeGeneric(fields) {
+    var bytes = utf8(JSON.stringify(fields));
+    return concat([u32(bytes.length), bytes]);
+  }
+
   // ==================== server -> client ====================
 
   function decodeWelcome(payload) {
@@ -456,6 +498,16 @@
       case 'websocket_close':
       case 'websocket_close_from_server':
         return decodeWebSocketClose(frame.payload);
+      case 'sse_close':
+      case 'sse_close_from_server':
+        // 服务端对 sse_close 走通用 JSON（u32 长度 + JSON）
+        try {
+          var view = new DataView(frame.payload.buffer, frame.payload.byteOffset, frame.payload.byteLength);
+          var jsonLen = view.getUint32(0);
+          return JSON.parse(decoder.decode(frame.payload.slice(4, 4 + jsonLen)));
+        } catch (error) {
+          return { type: 'sse_close', payload: frame.payload };
+        }
       default:
         return { type: frame.type, payload: frame.payload };
     }
@@ -480,6 +532,9 @@
     encodeHttpResponse: encodeHttpResponse,
     encodeWebSocketData: encodeWebSocketData,
     encodeWebSocketClose: encodeWebSocketClose,
+    encodeSSEData: encodeSSEData,
+    encodeSSEEnd: encodeSSEEnd,
+    encodeSSEError: encodeSSEError,
     decodeWebSocketData: decodeWebSocketData,
     decodeWebSocketClose: decodeWebSocketClose,
     decodeWelcome: decodeWelcome,
@@ -494,7 +549,7 @@
 function createSDK(Protocol) {
   'use strict';
 
-  var VERSION = '2.0.0';
+  var VERSION = '2.1.0';
   var DEFAULT_WS_URL = 'wss://res2.dtns.top/tunnel';
   var DOMAIN_RE = /^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$/i;
 
@@ -635,6 +690,8 @@ function createSDK(Protocol) {
       this.domain = message.domain || '';
       this.requestId = message.requestId || '';
       this.remoteAddress = message.remoteAddress || '';
+      this.isSSE = !!message.isSSE;
+      this.sseRequestId = message.sseRequestId || null;
       this.locals = {};
       this.message = message;
     }
@@ -759,6 +816,115 @@ function createSDK(Protocol) {
       this.app._sendResponse(this.message, status, headers, bytes);
       if (this.onFinish) this.onFinish(status);
       return this;
+    }
+  }
+
+  // SSE response for the legacy relay bypass (Capabilities stream=false):
+  //   browser -> relay: GET/POST with Accept: text/event-stream
+  //   relay  -> sdk  : http_request { isSSE: true, sseRequestId }
+  //   sdk    -> relay: sse_data / sse_end frames
+  // 中继已经写好了 200 + text/event-stream 头，所以这里只负责写事件体。
+  class SseResponse extends Emitter {
+    constructor(app, request, message, onFinish) {
+      super();
+      this.app = app;
+      this.req = request;
+      this.message = message;
+      this.statusCode = 200;
+      this.headers = {};
+      this.locals = {};
+      this.finished = false;
+      this.headersSent = false;
+      this.isSse = true;
+      this.sseRequestId = message.sseRequestId || null;
+      this.onFinish = onFinish || null;
+      this._closed = false;
+    }
+
+    status(code) { this.statusCode = Number(code) || 200; return this; }
+
+    set(name, value) {
+      if (!this.finished) this.headers[String(name).toLowerCase()] = String(value);
+      return this;
+    }
+
+    header(name, value) { return this.set(name, value); }
+    setHeader(name, value) { return this.set(name, value); }
+    get(name) { return this.headers[String(name).toLowerCase()]; }
+
+    type(value) {
+      var type = String(value || '');
+      if (type === 'json') type = 'application/json; charset=utf-8';
+      else if (type === 'text' || type === 'txt') type = 'text/plain; charset=utf-8';
+      else if (type === 'html') type = 'text/html; charset=utf-8';
+      else if (type.indexOf('/') === -1) type = 'application/' + type;
+      return this.set('content-type', type);
+    }
+
+    writeHead(status, headers) {
+      this.statusCode = Number(status) || this.statusCode;
+      var self = this;
+      Object.keys(headers || {}).forEach(function (key) {
+        self.headers[String(key).toLowerCase()] = String(headers[key]);
+      });
+      this.headersSent = true;
+      return this;
+    }
+
+    flushHeaders() {
+      this.headersSent = true;
+      return this;
+    }
+
+    write(chunk, encoding, callback) {
+      if (this.finished || this._closed) return false;
+      var text;
+      if (typeof chunk === 'string') text = chunk;
+      else if (chunk instanceof Uint8Array) text = textOf(chunk);
+      else if (chunk instanceof ArrayBuffer) text = textOf(new Uint8Array(chunk));
+      else text = String(chunk == null ? '' : chunk);
+
+      var sent = this.app._sendSseData(this.sseRequestId, text, 'message');
+      if (typeof encoding === 'function') encoding();
+      else if (typeof callback === 'function') callback();
+      return sent;
+    }
+
+    json(value) {
+      return this.end(JSON.stringify(value === undefined ? null : value));
+    }
+
+    send(value) {
+      if (value === undefined || value === null) return this.end('');
+      if (value instanceof Uint8Array) return this.end(value);
+      if (typeof value === 'object') return this.json(value);
+      return this.end(String(value));
+    }
+
+    text(value) {
+      return this.end(String(value == null ? '' : value));
+    }
+
+    end(chunk, encoding, callback) {
+      if (this.finished) return this;
+      if (chunk !== undefined && chunk !== null && chunk !== '') this.write(chunk);
+      this.finished = true;
+      this.headersSent = true;
+      this.app._sendSseEnd(this.sseRequestId);
+      try { this.app.sseStreams.delete(this.sseRequestId); } catch (error) { /* ignore */ }
+      if (typeof encoding === 'function') encoding();
+      else if (typeof callback === 'function') callback();
+      if (this.onFinish) this.onFinish(this.statusCode);
+      this.emit('finish');
+      return this;
+    }
+
+    _onClientClose() {
+      if (this._closed) return;
+      this._closed = true;
+      this.finished = true;
+      try { this.app.sseStreams.delete(this.sseRequestId); } catch (error) { /* ignore */ }
+      this.emit('close');
     }
   }
 
@@ -920,6 +1086,7 @@ function createSDK(Protocol) {
       this.middlewares = [];
       this.wsRoutes = [];
       this.wsConnections = new Map();
+      this.sseStreams = new Map();
       this.socket = null;
       this.ready = null;
       this.connected = false;
@@ -1021,6 +1188,7 @@ function createSDK(Protocol) {
       this.connected = false;
       this.registered = false;
       this._closeAllWs(1000, 'app closed');
+      this._closeAllSse();
       this._stopHeartbeat();
       if (this.reconnectTimer) {
         clearTimeout(this.reconnectTimer);
@@ -1053,6 +1221,7 @@ function createSDK(Protocol) {
         routes: this.routes.length,
         wsRoutes: this.wsRoutes.length,
         websockets: this.wsConnections.size,
+        sseStreams: this.sseStreams.size,
         middlewares: this.middlewares.length
       };
     }
@@ -1143,6 +1312,14 @@ function createSDK(Protocol) {
         if (closeConnection) closeConnection._onServerClose(message);
         return;
       }
+      if (message.type === 'sse_close') {
+        var sseResponse = this.sseStreams.get(message.sseRequestId);
+        if (sseResponse) {
+          this.sseStreams.delete(message.sseRequestId);
+          sseResponse._onClientClose();
+        }
+        return;
+      }
       if (message.type === 'heartbeat_ack') return;
     }
 
@@ -1175,6 +1352,7 @@ function createSDK(Protocol) {
       this.connected = false;
       this.registered = false;
       this._closeAllWs(1000, 'tunnel disconnected');
+      this._closeAllSse();
       this._stopHeartbeat();
       if (this.closed) return;
       this.emit('disconnected', { code: event.code || 0, reason: event.reason || '' });
@@ -1199,6 +1377,7 @@ function createSDK(Protocol) {
       this.connected = false;
       this.registered = false;
       this._closeAllWs(1000, 'tunnel failed');
+      this._closeAllSse();
       this._stopHeartbeat();
       if (this.reconnectTimer) {
         clearTimeout(this.reconnectTimer);
@@ -1282,9 +1461,13 @@ function createSDK(Protocol) {
       var started = now();
       this.requests += 1;
       var req = new Request(message);
-      var res = new Response(this, req, message, function (status) {
-        self._after(req, status, started);
-      });
+      var res = message.isSSE
+        ? new SseResponse(this, req, message, function (status) {
+          self._after(req, status, started);
+        })
+        : new Response(this, req, message, function (status) {
+          self._after(req, status, started);
+        });
 
       if (message.isWebSocket) {
         this._handleWebSocket(message, req, res);
@@ -1292,12 +1475,11 @@ function createSDK(Protocol) {
       }
 
       if (message.isSSE) {
-        res.status(501).json({
-          ok: false,
-          error: 'sse_not_supported',
-          hint: 'sdk.js app handles plain HTTP requests only.'
-        });
-        return;
+        if (!message.sseRequestId) {
+          res.status(500).json({ ok: false, error: 'missing_sse_request_id' });
+          return;
+        }
+        this.sseStreams.set(message.sseRequestId, res);
       }
 
       if (req.method === 'OPTIONS') {
@@ -1447,6 +1629,14 @@ function createSDK(Protocol) {
       this.wsConnections.clear();
     }
 
+    _closeAllSse() {
+      var self = this;
+      this.sseStreams.forEach(function (response) {
+        try { response._onClientClose(); } catch (error) { /* ignore */ }
+      });
+      this.sseStreams.clear();
+    }
+
     _parseBody(req) {
       var bytes = req.rawBody || new Uint8Array(0);
       if (bytes.length > this.maxBodySize) {
@@ -1589,6 +1779,31 @@ function createSDK(Protocol) {
       }
 
       run(0);
+    }
+
+    _sendSseData(sseRequestId, data, event) {
+      if (!sseRequestId) return false;
+      if (!this.socket || this.socket.readyState !== 1) {
+        this.emit('error', new SDKError('WebSocket is not open', { code: 'WS_NOT_OPEN' }));
+        return false;
+      }
+      var frame = Protocol.encodeSSEData({
+        sseRequestId: sseRequestId,
+        data: data === undefined || data === null ? '' : data,
+        event: event || '',
+        timestamp: new Date().toISOString()
+      });
+      return this._send(frame);
+    }
+
+    _sendSseEnd(sseRequestId) {
+      if (!sseRequestId) return false;
+      if (!this.socket || this.socket.readyState !== 1) return false;
+      var frame = Protocol.encodeSSEEnd({
+        sseRequestId: sseRequestId,
+        timestamp: new Date().toISOString()
+      });
+      return this._send(frame);
     }
 
     _sendResponse(message, status, headers, body) {

@@ -32,6 +32,7 @@
 - **内网穿透**：内置 DTNS HTTP-Proxy 隧道客户端，把 HTTP + WebSocket 一起暴露到公网域名。
 - **弱网优化**：16ms 输出合并、积压超限丢旧保新、`exit` 等关键帧强制送达。
 - **内置 MCP 端点**：同一套终端能力以 MCP（Model Context Protocol）暴露，Claude Desktop / Cursor / 各类 Agent 框架可直接挂载，不用写胶水层。
+- **OpenAI 兼容接口**：`/v1/chat/completions` 开箱可用。任何 OpenAI 客户端（Cherry Studio、Cline、LangChain、Shell 脚本）只要把 `base_url` 指过来，就能把终端当成「模型」调用——不用装 MCP 客户端，也不用写编排逻辑。
 - **机器可读 API 说明**：`/agent.json`、`/api.json` 返回结构化接口文档，Agent 拿到域名即可自助接入。
 - **可嵌入**：`ibbot-pty-sdk` 提供 `attachXterm()` 一行接入。
 
@@ -158,6 +159,40 @@ curl http://ai.pty2.<clientId>.html.dtns.top/agent.json
 
 - `client/agent.json` 是**单一数据源**，`client/api.json` 与 `client/js/agent-doc.js`（页面内嵌副本）由 `node client/tools/build-agent-doc.js` 生成，改文档只改 `agent.json`。
 - 即使静态文件未部署，路由也会用内嵌副本兜底，并注入运行时 `baseUrl` / `clientId` / MCP 端点。
+
+#### 6.3 OpenAI 兼容接口：任何聊天客户端都能「长出终端」
+
+`client/js/openai-compat.js` 把终端能力包成标准 OpenAI 协议，客户端只改两样东西——`base_url` 和 `model` 名：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/v1/models` | 可用「模型」列表 |
+| `POST` | `/v1/chat/completions` | 主入口，支持 `stream: true`（SSE） |
+| `POST` | `/v1/completions` | legacy 别名，`prompt → messages → text` 双向翻译 |
+| `POST` | `/v1/responses` | OpenAI 新版接口形状 |
+| `POST` | `/v1/embeddings` | 固定 501（明确不支持优于假装支持） |
+| `GET` | `/v1/_selftest` | 鉴权 / 主机 / 执行 / SSE / 上游五段体检 |
+
+按 `model` 名分流三种后端：
+
+| 模型名 | 行为 | 需要上游 LLM |
+|---|---|---|
+| `pty-exec` | **消息内容就是命令**，直接返回 stdout/stderr/exitCode | ❌ |
+| `pty-exec@<hostId>` | 同上，指定主机 | ❌ |
+| `<上游模型名>` | 原样转发到上游 LLM，页面变成一个带鉴权与审计的 LLM 网关 | ✅ |
+| `pty-agent` | 把 `exec` / `pty_*` / `fs_*` 以 function calling 注入上游，**工具循环在服务端跑**，客户端只收到文本 | ✅ |
+
+`pty-agent` 是差异最大的一项：MCP 要求客户端自己实现工具循环，而这里把循环搬到页面内，所以一个只会聊天的客户端也能让模型在你机器上执行多步任务。
+
+客户端配置示例（三行）：
+
+```text
+Base URL : http://ai.pty2.<clientId>.html.dtns.top/v1
+API Key  : sk-pty-xxxxxxxx   # 面板一键生成，只存本机浏览器
+Model    : pty-exec
+```
+
+设计上它是 `/api/*` 的**薄适配层**——所有执行走同一批处理函数，不存在"同一个 `rm` 在 `/api/exec` 被拦、在 `/v1` 放行"的可能。默认 `openaiEnabled=false`、`openaiReadOnly=true`，未生成 Key 一律 401。完整契约（请求/响应、错误信封、常见问题）见 [`client/OpenAI兼容接口-使用预览.md`](client/OpenAI兼容接口-使用预览.md)。
 
 ---
 
@@ -347,14 +382,16 @@ await client.exec('uname -a');    // 一次性命令
 ├── client/                     # 前端 SDK（ibbot-pty-sdk）
 │   ├── src/                    # ES Module 源码
 │   ├── dist/                   # 构建产物（UMD / ESM / CJS + d.ts）
-│   ├── js/                     # 独立脚本：sdk / pty-agent / pty2-agent / mcp-server / agent-doc
+│   ├── js/                     # 独立脚本：sdk / pty-agent / pty2-agent / mcp-server / openai-compat / agent-doc
 │   ├── agent.json              # 机器可读 API 说明（单一数据源）
 │   ├── api.json                # agent.json 的完整副本（生成物）
 │   ├── tools/
 │   │   └── build-agent-doc.js  # 由 agent.json 生成 api.json 与 js/agent-doc.js
 │   ├── test/
-│   │   └── mcp-smoke.js        # MCP + agent.json 冒烟测试（45 项，无外部依赖）
+│   │   ├── mcp-smoke.js        # MCP + agent.json 冒烟测试（45 项，无外部依赖）
+│   │   └── openai-compat.js    # OpenAI 兼容接口测试（27 项：流式 / 鉴权 / 会话 / agent 循环）
 │   ├── MCP-使用说明.md          # MCP 端点、工具清单、安全策略、客户端配置
+│   ├── OpenAI兼容接口-使用预览.md # /v1 接口契约、错误形态、常见问题
 │   ├── demo-hosts.html         # 演示面板（唯一发布的静态文件）
 │   ├── node-demo.js            # Node.js 用法示例
 │   ├── package.json
@@ -394,6 +431,12 @@ await client.exec('uname -a');    // 一次性命令
 **Q：MCP 端点和 HTTP API 是两套实现吗？**
 一套。`js/mcp-server.js` 只是把 `js/pty2-agent.js` 已有的 HTTP 能力按 MCP 协议包装（工具内部调用同一批处理函数），所以权限、限流、审计、只读模式对两边同时生效。
 
+**Q：OpenAI 兼容接口和 MCP 该用哪个？**
+看调用方。要「能力发现 + 工具清单」用 MCP（IDE、Cline、Claude Desktop 这类）；要「零改造接进现成聊天客户端」用 `/v1`。两者共用同一批执行函数与安全策略，不存在第二套权限逻辑。
+
+**Q：`/v1` 里输入 `ls` 报「不是内部或外部命令」？**
+那台主机是 Windows，默认 shell 是 cmd.exe，没有 POSIX 命令——用 `dir` / `cd` / `type`。适配层会追加 `[hint]` 提示替代命令，想用 bash 请在该主机装 Git Bash 或 WSL。
+
 **Q：商用可以吗？**
 GPLv3。可以商用，但分发或提供修改版服务时需按 GPLv3 开源你的修改。
 
@@ -425,3 +468,4 @@ GPLv3。可以商用，但分发或提供修改版服务时需按 GPLv3 开源�
 | v1.0.1 | 2026-10-27 | README 重写：补充同类项目对比、差异化竞争点、适用边界、完整接口与配置说明；配置模板对齐代码字段 |
 | v1.1.0 | 2026-10-29 | 新增 MCP 端点：`js/mcp-server.js` 实现 MCP Streamable HTTP（含 16 工具 / 6 资源 / 2 提示、Token、只读模式、限流、确认闸门），`pty2-agent.js` 挂载 `/mcp` 与 `/api/mcp/info`，附 `MCP-使用说明.md` 与 `test/mcp-smoke.js` |
 | v1.1.0 | 2026-10-29 | 新增机器可读 API 说明 `agent.json` / `api.json` 及生成工具 `tools/build-agent-doc.js`；Agent 域名下可直接 `GET /agent.json`、`GET /api.json` 自助接入 |
+| v1.2.0 | 2026-10-30 | 新增 OpenAI 兼容接口：`js/openai-compat.js` 提供 `/v1/models`、`/v1/chat/completions`、`/v1/completions`、`/v1/responses`、`/v1/_selftest`，支持 `pty-exec`（消息即命令）/ 上游代理 / `pty-agent`（服务端跑工具循环）三种后端与 SSE 流式；附 `OpenAI兼容接口-使用预览.md` 与 `test/openai-compat.js`（27 项）；修正客户端模型切换通知被误当命令执行的问题 |

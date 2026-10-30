@@ -1448,6 +1448,8 @@
     PROTOCOL_VERSIONS: PROTOCOL_VERSIONS,
     LEGACY_VERSIONS: LEGACY_VERSIONS,
     TOOLS: TOOLS,
-    createServer: createServer
+    createServer: createServer,
+    // 供 openai-compat.js 复用同一个页面确认框
+    confirm: defaultConfirm
   };
 });

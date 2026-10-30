@@ -10,7 +10,7 @@
   "scripts": {
     "build": "rollup -c",
     "dev": "rollup -c -w",
-    "test": "node test/mcp-smoke.js",
+    "test": "node test/mcp-smoke.js && node test/openai-compat.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": ["pty", "terminal", "websocket", "ssh", "xterm", "ibbot"],

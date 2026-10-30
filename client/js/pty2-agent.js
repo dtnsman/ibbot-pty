@@ -29,7 +29,7 @@
   var SDK_VERSION = (SDK && SDK.version) || '2.0.0';
 
   var SERVICE_NAME = 'pty-agent';
-  var SERVICE_VERSION = '2.1.0';
+  var SERVICE_VERSION = '2.2.1';
 
   var DEFAULT_WS_URL = 'wss://res2.dtns.top/tunnel';
   var DOMAIN_PREFIX = 'ai.pty2';
@@ -222,7 +222,29 @@
     mcpAllowedOrigins: ['*'],
     mcpDisabledTools: [],
     mcpStrictHeaders: true,
-    mcpRequireClientCapabilities: false
+    mcpRequireClientCapabilities: false,
+    // ---- OpenAI 兼容接口（/v1/*） ----
+    openaiEnabled: false,
+    openaiApiKey: '',
+    openaiMode: 'exec',
+    openaiReadOnly: true,
+    openaiAllowWarn: true,
+    openaiAllowDanger: false,
+    openaiRequireApproval: false,
+    openaiApprovalTimeoutMs: 60000,
+    openaiDisableTools: false,
+    openaiSystemPrompt: '',
+    openaiMaxSteps: 6,
+    openaiMaxConcurrent: 2,
+    openaiRateLimitPerMin: 60,
+    openaiToolResultLimit: 16000,
+    openaiProxyTimeoutMs: 120000,
+    openaiAgentTimeoutMs: 180000,
+    openaiSessionTimeoutMs: 30000,
+    openaiTrace: false,
+    openaiUpstreamBase: '',
+    openaiUpstreamKey: '',
+    openaiUpstreamModel: ''
   };
 
   function genClientId() {
@@ -236,6 +258,25 @@
 
   function isValidClientId(id) {
     return typeof id === 'string' && /^[a-z0-9][a-z0-9-]{2,39}$/.test(id);
+  }
+
+  // 生成 sk-pty-xxxx 形式的 API Key（优先用 crypto，退化到 Math.random）
+  function genApiKey() {
+    var hex = '';
+    try {
+      if (ROOT.crypto && typeof ROOT.crypto.getRandomValues === 'function') {
+        var bytes = new Uint8Array(18);
+        ROOT.crypto.getRandomValues(bytes);
+        hex = Array.prototype.map.call(bytes, function (b) {
+          return ('0' + b.toString(16)).slice(-2);
+        }).join('');
+      }
+    } catch (e) { hex = ''; }
+    if (!hex) {
+      hex = '';
+      for (var i = 0; i < 6; i++) hex += Math.random().toString(36).slice(2, 8);
+    }
+    return 'sk-pty-' + hex.slice(0, 36);
   }
 
   var Config = {
@@ -546,6 +587,12 @@
     ['ALL', '/api/security/check', '命令安全检查'],
     ['ALL', '/api/mcp/info', 'MCP 端点信息、协议版本与工具清单'],
     ['MCP', '/mcp', 'MCP Streamable HTTP（POST 调用 / GET 信息 / DELETE 405）'],
+    ['ALL', '/v1/models', 'OpenAI 兼容：模型列表（pty-exec / pty-agent / 上游模型）'],
+    ['ALL', '/v1/chat/completions', 'OpenAI 兼容：对话补全（exec / proxy / agent 三种后端）'],
+    ['ALL', '/v1/completions', 'OpenAI 兼容：legacy 文本补全（映射到 chat，不支持 pty-agent）'],
+    ['ALL', '/v1/responses', 'OpenAI 兼容：Responses API'],
+    ['ALL', '/v1/embeddings', 'OpenAI 兼容：不支持（固定返回 501）'],
+    ['ALL', '/v1/_selftest', 'OpenAI 兼容：鉴权 / 主机 / 执行 / SSE / 上游连通自检'],
     ['WS', '/api/pty/stream', '终端实时输出流（WebSocket）']
   ];
 
@@ -673,6 +720,7 @@
           errors: st.errors,
           uptimeMs: st.uptimeMs,
           mcp: mcpStats || { enabled: Config.get().mcpEnabled !== false, requests: 0, toolCalls: 0 },
+          openai: app.__openaiServer ? app.__openaiServer.stats() : { enabled: Config.get().openaiEnabled === true, requests: 0, chatCalls: 0 },
           timestamp: new Date().toISOString()
         });
       },
@@ -703,7 +751,8 @@
             'exec_local', 'exec_ssh',
             'fs_list', 'fs_download', 'fs_download_raw', 'fs_upload', 'fs_upload_raw', 'fs_delete',
             'ai_context', 'security_check',
-            'mcp', 'mcp_tools', 'mcp_resources', 'mcp_prompts'
+            'mcp', 'mcp_tools', 'mcp_resources', 'mcp_prompts',
+            'openai_compat', 'openai_chat', 'openai_stream', 'openai_tools'
           ],
           mcp: {
             enabled: cfg.mcpEnabled !== false,
@@ -711,6 +760,11 @@
             transport: 'streamable-http',
             protocolVersions: ROOT.Pty2Mcp ? ROOT.Pty2Mcp.PROTOCOL_VERSIONS : [],
             tools: mcpTools
+          },
+          openai: app.__openaiServer ? Object.assign({ baseUrl: app.apiBase + '/v1' }, app.__openaiServer.info()) : {
+            enabled: false,
+            baseUrl: app.apiBase + '/v1',
+            note: 'openai-compat.js 未加载或服务未启动'
           },
           hosts: (ctx.hosts || []).map(function (h) {
             return { id: h.id, name: h.name, url: h.url };
@@ -1474,6 +1528,78 @@
     });
   }
 
+  // ============================================================
+  // 9.4b OpenAI 兼容接口（/v1/*）
+  //      薄适配层：所有执行动作复用 handlers（通过 call 注入），
+  //      本层只做 OpenAI 协议翻译，不重复实现任何执行逻辑。
+  // ============================================================
+  function defineOpenAICompatRoutes(app, ctx, handlers, options) {
+    var OAI = ROOT.Pty2OpenAI;
+    if (!OAI) {
+      console.warn('[Pty2Agent] openai-compat.js 未加载，/v1/* 不可用');
+      return;
+    }
+
+    var logger = (options && typeof options.log === 'function') ? options.log : null;
+    var MCP = ROOT.Pty2Mcp;
+
+    var server = OAI.createServer({
+      call: makeHandlerCaller(handlers),
+      getConfig: function () { return Config.get(); },
+      getService: function () {
+        return {
+          domain: app.domain,
+          apiBase: app.apiBase,
+          clientId: app.clientId,
+          version: SERVICE_VERSION,
+          sdkVersion: SDK_VERSION
+        };
+      },
+      getHosts: function () {
+        return (ctx.hosts || []).map(function (h) {
+          var rt = ctx.runtime ? ctx.runtime.get(h.id) : null;
+          return { id: h.id, name: h.name, url: h.url, connected: isRtConnected(rt) };
+        });
+      },
+      // 复用 MCP 的页面确认框，避免两套 UI
+      confirm: MCP && typeof MCP.confirm === 'function' ? MCP.confirm : null,
+      log: function (entry) {
+        if (!logger) return;
+        try {
+          var parts = ['OpenAI ' + (entry.event || '')];
+          if (entry.kind) parts.push(entry.kind);
+          if (entry.model) parts.push(entry.model);
+          if (entry.mode) parts.push(entry.mode);
+          if (entry.blocked) parts.push('blocked');
+          if (entry.message) parts.push(String(entry.message).slice(0, 160));
+          logger(parts.join(' '), entry.event === 'error' || entry.blocked ? 'warn' : 'info');
+        } catch (e) { /* ignore */ }
+      }
+    });
+
+    app.__openaiServer = server;
+
+    var KINDS = [
+      ['/v1/models', 'models'],
+      ['/v1/chat/completions', 'chat'],
+      ['/v1/completions', 'completions'],
+      ['/v1/responses', 'responses'],
+      ['/v1/embeddings', 'embeddings'],
+      ['/v1/_selftest', 'selftest']
+    ];
+
+    KINDS.forEach(function (item) {
+      app.all(item[0], function (req, res) {
+        return server.handle(item[1], req, res);
+      });
+    });
+
+    // 其余 /v1/* 统一返回 OpenAI 风格 404；必须注册在 app.all('/*') 之前
+    app.all('/v1/*', function (req, res) {
+      return server.handle('notfound', req, res);
+    });
+  }
+
   function defineRoutes(app, ctx, options) {
     var handlers = createHandlers(app, ctx);
 
@@ -1526,6 +1652,9 @@
 
     // 9.4 MCP Streamable HTTP（POST / GET / DELETE）
     defineMcpRoutes(app, ctx, handlers, options);
+
+    // 9.4b OpenAI 兼容接口（/v1/*），必须在 9.5 的 404 兜底之前注册
+    defineOpenAICompatRoutes(app, ctx, handlers, options);
 
     // 9.5 WebSocket 终端实时流
     app.ws('/api/pty/stream', function (ws, req) {
@@ -1747,6 +1876,59 @@
           <button id="p2aMcpTokenSave" style="padding:6px 10px;">保存</button>
         </div>
 
+        <div style="margin:14px 0 10px; border-top:1px solid #333; padding-top:12px;">
+          <b style="color:#a5b4fc; font-size:13px;">🔌 OpenAI 兼容接口（/v1）</b>
+        </div>
+
+        <div style="margin-bottom:10px;">
+          <label style="display:block; color:#bdc3c7; margin-bottom:4px;">Base URL（客户端填这个，注意带 /v1）</label>
+          <div class="p2a-row" style="display:flex; gap:6px;">
+            <input id="p2aOpenAIUrl" type="text" readonly style="flex:1; padding:6px; background:#1e1e1e; color:#8cf; border:1px solid #444; border-radius:4px; font-family:monospace; font-size:12px;">
+            <button id="p2aCopyOpenAI" style="padding:6px 10px;">📋</button>
+          </div>
+        </div>
+
+        <div style="display:flex; gap:8px; margin-bottom:10px;">
+          <input id="p2aOpenAIKey" type="text" placeholder="API Key（sk-pty-...）" style="flex:1; padding:6px; background:#1e1e1e; color:#eee; border:1px solid #444; border-radius:4px; font-family:monospace; font-size:12px;">
+          <button id="p2aOpenAIKeyGen" style="padding:6px 10px;">生成</button>
+          <button id="p2aOpenAIKeySave" style="padding:6px 10px;">保存</button>
+          <button id="p2aOpenAIKeyCopy" style="padding:6px 10px;">📋</button>
+        </div>
+
+        <div style="margin-bottom:10px; display:flex; flex-direction:column; gap:6px;">
+          <label style="display:flex; align-items:center; gap:6px; color:#bdc3c7; cursor:pointer;">
+            <input id="p2aOpenAIEnabled" type="checkbox">
+            启用 OpenAI 兼容接口（默认关闭）
+          </label>
+          <label style="display:flex; align-items:center; gap:6px; color:#bdc3c7; cursor:pointer;">
+            <input id="p2aOpenAIReadOnly" type="checkbox">
+            只读模式：仅执行白名单内的安全命令（默认开启）
+          </label>
+          <label style="display:flex; align-items:center; gap:6px; color:#bdc3c7; cursor:pointer;">
+            <input id="p2aOpenAIDanger" type="checkbox">
+            允许 danger 级命令（默认关闭，风险极高）
+          </label>
+          <label style="display:flex; align-items:center; gap:6px; color:#bdc3c7; cursor:pointer;">
+            <input id="p2aOpenAIApproval" type="checkbox">
+            执行前需页面确认（默认关闭）
+          </label>
+        </div>
+
+        <details style="margin-bottom:10px;">
+          <summary style="cursor:pointer; color:#a5b4fc; margin-bottom:6px;">🔗 上游 LLM（M2 代理 / M3 agent 需要）</summary>
+          <div style="display:flex; flex-direction:column; gap:6px; margin-top:6px;">
+            <input id="p2aOpenAIUpBase" type="text" placeholder="https://api.deepseek.com/v1" style="padding:6px; background:#1e1e1e; color:#eee; border:1px solid #444; border-radius:4px; font-family:monospace; font-size:12px;">
+            <input id="p2aOpenAIUpKey" type="text" placeholder="上游 API Key（只存在本机浏览器）" style="padding:6px; background:#1e1e1e; color:#eee; border:1px solid #444; border-radius:4px; font-family:monospace; font-size:12px;">
+            <input id="p2aOpenAIUpModel" type="text" placeholder="上游模型名，如 deepseek-chat" style="padding:6px; background:#1e1e1e; color:#eee; border:1px solid #444; border-radius:4px; font-family:monospace; font-size:12px;">
+            <div style="display:flex; gap:8px;">
+              <button id="p2aOpenAIUpSave" style="flex:1; padding:6px 10px;">保存上游配置</button>
+              <button id="p2aOpenAISelftest" style="flex:1; padding:6px 10px;">连通性自检</button>
+            </div>
+          </div>
+        </details>
+
+        <div id="p2aOpenAIHint" style="background:#1e1e1e; padding:8px; border-radius:4px; font-family:monospace; font-size:11px; line-height:1.6; color:#9ca3af; margin-bottom:10px; white-space:pre-wrap; word-break:break-all;"></div>
+
         <div style="margin-bottom:10px; display:flex; flex-direction:column; gap:6px;">
           <label style="display:flex; align-items:center; gap:6px; color:#bdc3c7; cursor:pointer;">
             <input id="p2aAllowDanger" type="checkbox">
@@ -1854,6 +2036,84 @@
         Config.update({ mcpToken: $('p2aMcpToken').value.trim() });
         self._log('MCP Token 已保存', 'info');
       };
+
+      // ---------------- OpenAI 兼容接口 ----------------
+      $('p2aCopyOpenAI').onclick = function () { self._copy((self.agent.getStatus().url || Config.getUrl()) + '/v1'); };
+      $('p2aOpenAIKeyGen').onclick = function () {
+        var key = genApiKey();
+        $('p2aOpenAIKey').value = key;
+        Config.update({ openaiApiKey: key });
+        self._log('已生成 OpenAI 兼容 API Key（客户端用 Authorization: Bearer ' + key.slice(0, 12) + '...）', 'warn');
+        self._refresh();
+      };
+      $('p2aOpenAIKeyCopy').onclick = function () {
+        var key = $('p2aOpenAIKey').value.trim() || Config.current.openaiApiKey || '';
+        if (!key) {
+          self._log('还没有 API Key，先点「生成」', 'error');
+          return;
+        }
+        self._copy(key);
+      };
+      $('p2aOpenAIKeySave').onclick = function () {
+        Config.update({ openaiApiKey: $('p2aOpenAIKey').value.trim() });
+        self._log('OpenAI API Key 已保存', 'info');
+        self._refresh();
+      };
+      $('p2aOpenAIEnabled').onchange = function (e) {
+        var on = e.target.checked;
+        var patch = { openaiEnabled: on };
+        // 启用但没有 Key 是死胡同（客户端一律 401 no_api_key_configured），这里自动补一个
+        if (on && !(Config.current.openaiApiKey || '').trim()) {
+          var key = genApiKey();
+          patch.openaiApiKey = key;
+          $('p2aOpenAIKey').value = key;
+          self._log('已启用，并自动生成 API Key：' + key, 'warn');
+        } else {
+          self._log('openaiEnabled = ' + on, on ? 'warn' : 'info');
+        }
+        Config.update(patch);
+        self._refresh();
+      };
+      $('p2aOpenAIReadOnly').onchange = function (e) {
+        Config.update({ openaiReadOnly: e.target.checked });
+        self._log('openaiReadOnly = ' + e.target.checked, e.target.checked ? 'info' : 'warn');
+      };
+      $('p2aOpenAIDanger').onchange = function (e) {
+        Config.update({ openaiAllowDanger: e.target.checked });
+        self._log('openaiAllowDanger = ' + e.target.checked, 'error');
+      };
+      $('p2aOpenAIApproval').onchange = function (e) {
+        Config.update({ openaiRequireApproval: e.target.checked });
+        self._log('openaiRequireApproval = ' + e.target.checked, 'warn');
+      };
+      $('p2aOpenAIUpSave').onclick = function () {
+        Config.update({
+          openaiUpstreamBase: $('p2aOpenAIUpBase').value.trim(),
+          openaiUpstreamKey: $('p2aOpenAIUpKey').value.trim(),
+          openaiUpstreamModel: $('p2aOpenAIUpModel').value.trim()
+        });
+        self._log('上游 LLM 配置已保存（仅存本机浏览器）', 'info');
+        self._refresh();
+      };
+      $('p2aOpenAISelftest').onclick = async function () {
+        self._log('正在自检 OpenAI 兼容接口...', 'info');
+        try {
+          var res = await fetch((self.agent.getStatus().url || Config.getUrl()) + '/v1/_selftest', {
+            headers: { authorization: 'Bearer ' + ($('p2aOpenAIKey').value.trim() || Config.current.openaiApiKey || '') }
+          });
+          var json = await res.json();
+          var lines = [];
+          var chk = json.checks || {};
+          lines.push('鉴权：' + (chk.auth || '?'));
+          if (chk.host) lines.push('主机：' + (chk.host.id || '-') + (chk.host.connected ? ' 已连接' : ' 未连接'));
+          if (chk.exec) lines.push('执行：' + (chk.exec.ok ? 'ok ' + (chk.exec.sample || '') : '失败 ' + (chk.exec.reason || '')));
+          if (chk.sse) lines.push('SSE：' + chk.sse.transport + ' / ' + chk.sse.framing);
+          if (chk.upstream) lines.push('上游：' + (chk.upstream.reachable ? 'ok ' + (chk.upstream.status || '') : '不可用 ' + (chk.upstream.reason || '')));
+          self._log('自检结果\n' + lines.join('\n'), json.ok ? 'success' : 'warn');
+        } catch (e) {
+          self._log('自检失败：' + ((e && e.message) || e), 'error');
+        }
+      };
       $('p2aAllowDanger').onchange = function (e) {
         Config.update({ allowDanger: e.target.checked });
         self._log('allowDanger = ' + e.target.checked, 'warn');
@@ -1952,6 +2212,33 @@
         $('p2aMcpToken').value = cfg.mcpToken || '';
       }
 
+      var baseUrl = status.url || Config.getUrl();
+      $('p2aOpenAIUrl').value = baseUrl + '/v1';
+      $('p2aOpenAIEnabled').checked = cfg.openaiEnabled === true;
+      $('p2aOpenAIReadOnly').checked = cfg.openaiReadOnly === true;
+      $('p2aOpenAIDanger').checked = cfg.openaiAllowDanger === true;
+      $('p2aOpenAIApproval').checked = cfg.openaiRequireApproval === true;
+      if (document.activeElement !== $('p2aOpenAIKey')) {
+        $('p2aOpenAIKey').value = cfg.openaiApiKey || '';
+      }
+      if (document.activeElement !== $('p2aOpenAIUpBase')) $('p2aOpenAIUpBase').value = cfg.openaiUpstreamBase || '';
+      if (document.activeElement !== $('p2aOpenAIUpKey')) $('p2aOpenAIUpKey').value = cfg.openaiUpstreamKey || '';
+      if (document.activeElement !== $('p2aOpenAIUpModel')) $('p2aOpenAIUpModel').value = cfg.openaiUpstreamModel || '';
+      $('p2aOpenAIHint').textContent = [
+        '# 客户端配置',
+        'Base URL : ' + baseUrl + '/v1',
+        'API Key  : ' + (cfg.openaiApiKey ? cfg.openaiApiKey.slice(0, 14) + '...' : '（未生成 —— 客户端会收到 401 no_api_key_configured）'),
+        '',
+        '# 模型',
+        'pty-exec            消息即命令，不调 LLM',
+        'pty-exec@<hostId>   指定主机',
+        'pty-agent           上游 LLM + PTY 工具（需配置上游）',
+        (cfg.openaiUpstreamModel || '<上游模型名>') + '    原样代理到上游',
+        '',
+        '# 试一下',
+        'curl ' + baseUrl + '/v1/models -H "Authorization: Bearer <key>"'
+      ].join('\n');
+
       var dot = function (ok) { return ok ? '🟢' : '🔴'; };
       var uptime = function (ms) {
         if (!ms) return '-';
@@ -1972,6 +2259,10 @@
         '<div>🔌 MCP：<b>' + (cfg.mcpEnabled !== false ? (cfg.mcpReadOnly === true ? '只读' : '启用') : '关闭') + '</b> · 工具 ' +
           (mcpStats.tools || 0) + ' · 调用 ' + (mcpStats.toolCalls || 0) +
           ' 次 · 错误 ' + (mcpStats.errors || 0) + ' 次</div>',
+        '<div>🤖 OpenAI：<b>' + (cfg.openaiEnabled === true ? (cfg.openaiReadOnly === true ? '只读' : '启用') : '关闭') + '</b>' +
+          (cfg.openaiApiKey ? '' : ' · <span style="color:#e67e22;">未生成 Key</span>') +
+          ' · ' + (status.openai && status.openai.chatCalls ? status.openai.chatCalls : 0) + ' 次调用' +
+          (status.openai && status.openai.toolCalls ? ' · 工具 ' + status.openai.toolCalls + ' 次' : '') + '</div>',
         '<div>📊 请求 ' + (status.requests || 0) + ' 次 · 错误 ' + (status.errors || 0) +
           ' 次 · WebSocket ' + (status.websockets || 0) + ' 个</div>',
         status.started
@@ -1989,7 +2280,10 @@
       if (!el) return;
 
       el.innerHTML = this.agent.listRoutes().map(function (r) {
-        var color = r.method === 'WS' ? '#c084fc' : (r.method === 'MCP' ? '#f472b6' : (r.method === 'GET' ? '#6ee7b7' : '#fbbf24'));
+        var color = r.method === 'WS' ? '#c084fc'
+          : (r.method === 'MCP' ? '#f472b6'
+            : (r.path.indexOf('/v1/') === 0 ? '#34d399'
+              : (r.method === 'GET' ? '#6ee7b7' : '#fbbf24')));
         return '<div><span style="color:' + color + '; font-weight:bold;">' + r.method + '</span> ' +
           escapeHtml(r.path) + '<span style="color:#777;"> — ' + escapeHtml(r.desc || '') + '</span></div>';
       }).join('');
@@ -2068,7 +2362,22 @@
         "  -H 'MCP-Protocol-Version: 2026-07-28' \\",
         "  -H 'Mcp-Method: tools/call' \\",
         "  -H 'Mcp-Name: host_list' \\",
-        '  -d \'{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"host_list","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}\''
+        '  -d \'{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"host_list","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}\'',
+        '',
+        '# 13. OpenAI 兼容：模型列表',
+        'curl ' + url + '/v1/models -H "Authorization: Bearer <sk-pty-key>"',
+        '',
+        '# 14. OpenAI 兼容：执行命令（pty-exec）',
+        'curl -X POST ' + url + '/v1/chat/completions \\',
+        "  -H 'Authorization: Bearer <sk-pty-key>' \\",
+        "  -H 'Content-Type: application/json' \\",
+        '  -d \'{"model":"pty-exec","messages":[{"role":"user","content":"uname -a"}]}\'',
+        '',
+        '# 15. OpenAI 兼容：流式（pty-agent，需先配上游）',
+        'curl -N -X POST ' + url + '/v1/chat/completions \\',
+        "  -H 'Authorization: Bearer <sk-pty-key>' \\",
+        "  -H 'Content-Type: application/json' \\",
+        '  -d \'{"model":"pty-agent","stream":true,"messages":[{"role":"user","content":"看看磁盘还剩多少"}]}\''
       ].join('\n');
     }
 
@@ -2312,7 +2621,16 @@
         url: Config.getUrl(cfg.clientId),
         wsUrl: cfg.wsUrl || DEFAULT_WS_URL,
         sdkVersion: SDK ? SDK.version : null,
-        mcp: mcpStats
+        mcp: mcpStats,
+        openai: this.app && this.app.__openaiServer ? this.app.__openaiServer.stats() : {
+          enabled: cfg.openaiEnabled === true,
+          requests: 0,
+          chatCalls: 0,
+          toolCalls: 0,
+          errors: 0,
+          keySet: !!cfg.openaiApiKey,
+          mode: cfg.openaiMode || 'exec'
+        }
       };
 
       if (!this.app) {
@@ -2343,6 +2661,7 @@
   ROOT.Pty2AgentConfig = Config;
   ROOT.Pty2AgentBase64 = Base64;
   ROOT.Pty2AgentRoutes = ROUTE_INFO;
+  ROOT.Pty2AgentUtil = { genApiKey: genApiKey, checkCommandSafety: checkCommandSafety };
   ROOT.Pty2AgentSecurity = {
     checkCommandSafety: checkCommandSafety,
     DANGEROUS_PATTERNS: DANGEROUS_PATTERNS,
@@ -2354,6 +2673,7 @@
     module.exports = Pty2Agent;
     module.exports.Pty2Agent = Pty2Agent;
     module.exports.defineRoutes = defineRoutes;
+    module.exports.defineOpenAICompatRoutes = defineOpenAICompatRoutes;
     module.exports.Config = Config;
     module.exports.ROUTE_INFO = ROUTE_INFO;
     module.exports.Security = ROOT.Pty2AgentSecurity;

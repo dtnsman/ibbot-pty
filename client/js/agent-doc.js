@@ -10,9 +10,9 @@
   "schema": "pty-agent-api/1",
   "name": "PTY Agent HTTP API",
   "service": "pty-agent",
-  "version": "2.1.0",
+  "version": "2.2.1",
   "sdkVersion": "2.0.0",
-  "description": "IBBot PTY Manager v2 把浏览器里已连接的本地 / SSH 终端，通过 DTNS 隧道暴露成标准 HTTP API + WebSocket 实时流 + MCP 端点。HTTP-API 调用方（脚本、Agent、LLM 工具）只需 GET/POST 即可读写终端、执行命令、传输文件。",
+  "description": "IBBot PTY Manager v2 把浏览器里已连接的本地 / SSH 终端，通过 DTNS 隧道暴露成标准 HTTP API + WebSocket 实时流 + MCP 端点 + OpenAI 兼容接口（/v1）。HTTP-API 调用方（脚本、Agent、LLM 工具）只需 GET/POST 即可读写终端、执行命令、传输文件；聊天客户端把 base_url 指向 /v1 即可把终端当成「模型」使用。",
   "baseUrl": "http://ai.pty2.<clientId>.html.dtns.top",
   "baseUrlTemplate": true,
   "baseUrlNote": "实际 baseUrl 见页面「🤖 Agent」面板的 Agent URL，或直接 GET /api/info 的 apiBase 字段；本文档由服务端返回时 baseUrl 会被替换为真实地址。",
@@ -25,6 +25,7 @@
     "apiJson": "/api.json",
     "mcpInfo": "/api/mcp/info",
     "mcpEndpoint": "/mcp",
+    "openaiBase": "/v1",
     "websocket": "/api/pty/stream"
   },
   "conventions": {
@@ -69,6 +70,11 @@
       "step": 6,
       "title": "给支持 MCP 的客户端直接接入",
       "request": "端点 http://ai.pty2.<clientId>.html.dtns.top/mcp（Streamable HTTP）"
+    },
+    {
+      "step": 7,
+      "title": "把终端当成 OpenAI 模型接进任意聊天客户端",
+      "request": "Base URL: http://ai.pty2.<clientId>.html.dtns.top/v1\nAPI Key : sk-pty-xxxxxxxx（面板生成）\nModel   : pty-exec（消息即命令）或 pty-agent（需配置上游 LLM）\n\ncurl http://ai.pty2.<clientId>.html.dtns.top/v1/chat/completions -H 'Authorization: Bearer sk-pty-xxxxxxxx' -H 'Content-Type: application/json' -d '{\"model\":\"pty-exec\",\"messages\":[{\"role\":\"user\",\"content\":\"uname -a\"}]}'"
     }
   ],
   "endpoints": [
@@ -81,7 +87,7 @@
       "responseExample": {
         "ok": true,
         "service": "pty-agent",
-        "version": "2.1.0",
+        "version": "2.2.1",
         "sdkVersion": "2.0.0",
         "clientId": "<clientId>",
         "domain": "ai.pty2.<clientId>.html.dtns.top",
@@ -106,7 +112,7 @@
       "responseExample": {
         "status": "ok",
         "service": "pty-agent",
-        "version": "2.1.0",
+        "version": "2.2.1",
         "sdkVersion": "2.0.0",
         "clientId": "<clientId>",
         "domain": "ai.pty2.<clientId>.html.dtns.top",
@@ -146,7 +152,7 @@
       "responseExample": {
         "success": true,
         "name": "PTY Agent Service",
-        "version": "2.1.0",
+        "version": "2.2.1",
         "sdkVersion": "2.0.0",
         "clientId": "<clientId>",
         "domain": "ai.pty2.<clientId>.html.dtns.top",
@@ -258,7 +264,7 @@
       "responseExample": {
         "success": true,
         "name": "pty-agent MCP",
-        "version": "2.1.0",
+        "version": "2.2.1",
         "enabled": true,
         "readOnly": false,
         "endpoint": "http://ai.pty2.<clientId>.html.dtns.top/mcp",
@@ -1096,6 +1102,315 @@
           "error": "command is required"
         }
       ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/models",
+      "summary": "OpenAI 兼容：模型列表",
+      "description": "列出可用的「模型」：pty-exec（消息即命令）、pty-exec@<hostId>（指定主机）、pty-agent（上游 LLM + PTY 工具）、以及配置的上游模型名。需要 Authorization: Bearer <openaiApiKey>。",
+      "params": [],
+      "responseExample": {
+        "object": "list",
+        "data": [
+          {
+            "id": "pty-exec",
+            "object": "model",
+            "created": 1730000000,
+            "owned_by": "pty2-openai",
+            "mode": "exec"
+          },
+          {
+            "id": "pty-agent",
+            "object": "model",
+            "created": 1730000000,
+            "owned_by": "pty2-openai",
+            "mode": "agent"
+          },
+          {
+            "id": "pty-exec@<hostId>",
+            "object": "model",
+            "created": 1730000000,
+            "owned_by": "pty2-openai",
+            "mode": "exec",
+            "hostId": "<hostId>"
+          }
+        ]
+      },
+      "errors": [
+        {
+          "status": 401,
+          "error": "missing_api_key / invalid_api_key"
+        },
+        {
+          "status": 404,
+          "error": "endpoint_disabled"
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "summary": "OpenAI 兼容：对话补全（三种后端）",
+      "description": "按 model 名分流：pty-exec 直接把最后一条 user 消息当命令执行；pty-agent 调上游 LLM 并注入 PTY 工具、在本层跑 agent 循环；其它模型名原样透传上游。支持 stream:true 的 SSE 流式。错误统一为 OpenAI 信封。",
+      "params": [
+        {
+          "name": "model",
+          "in": "body",
+          "type": "string",
+          "required": true,
+          "description": "pty-exec / pty-exec@<hostId> / pty-agent / <上游模型名>"
+        },
+        {
+          "name": "messages",
+          "in": "body",
+          "type": "array",
+          "required": true,
+          "description": "标准 OpenAI 消息数组"
+        },
+        {
+          "name": "stream",
+          "in": "body",
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "true 时按 SSE 逐块返回"
+        },
+        {
+          "name": "stream_options.include_usage",
+          "in": "body",
+          "type": "boolean",
+          "required": false,
+          "description": "true 时末尾追加一个只有 usage 的 chunk"
+        }
+      ],
+      "requestExample": "curl -X POST '.../v1/chat/completions' -H 'Authorization: Bearer sk-pty-xxx' -H 'Content-Type: application/json' -d '{\"model\":\"pty-exec\",\"messages\":[{\"role\":\"user\",\"content\":\"uname -a\"}]}'",
+      "responseExample": {
+        "id": "chatcmpl-pty-7f3a1c",
+        "object": "chat.completion",
+        "created": 1730000123,
+        "model": "pty-exec",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "Linux office-pc 6.1.0-13-amd64 ..."
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 9,
+          "completion_tokens": 42,
+          "total_tokens": 51,
+          "source": "estimated"
+        },
+        "pty": {
+          "hostId": "office-pc",
+          "command": "uname -a",
+          "exitCode": 0,
+          "durationMs": 118,
+          "risk": "safe",
+          "blocked": false
+        }
+      },
+      "errors": [
+        {
+          "status": 400,
+          "error": "messages_required / upstream_not_configured"
+        },
+        {
+          "status": 401,
+          "error": "missing_api_key / invalid_api_key"
+        },
+        {
+          "status": 429,
+          "error": "rate_limited / too_many_concurrent_requests"
+        },
+        {
+          "status": 502,
+          "error": "upstream_unreachable / upstream_error"
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/completions",
+      "summary": "OpenAI 兼容：legacy 文本补全别名",
+      "description": "把 prompt 包成 messages 后复用 chat 内核，再把 message.content 还原成 choices[].text。不支持 pty-agent（工具调用在 completions 协议里没有承载字段）。",
+      "params": [
+        {
+          "name": "model",
+          "in": "body",
+          "type": "string",
+          "required": true,
+          "description": "pty-exec 或上游模型名"
+        },
+        {
+          "name": "prompt",
+          "in": "body",
+          "type": "string",
+          "required": true,
+          "description": "提示文本；数组时每个元素独立生成一个 choice"
+        },
+        {
+          "name": "echo",
+          "in": "body",
+          "type": "boolean",
+          "required": false,
+          "description": "true 时把 prompt 原文前置到 text"
+        }
+      ],
+      "responseExample": {
+        "id": "cmpl-pty-9x",
+        "object": "text_completion",
+        "created": 1730000123,
+        "model": "pty-exec",
+        "choices": [
+          {
+            "text": "Linux office-pc ...",
+            "index": 0,
+            "logprobs": null,
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 3,
+          "completion_tokens": 12,
+          "total_tokens": 15,
+          "source": "estimated"
+        }
+      },
+      "errors": [
+        {
+          "status": 400,
+          "error": "prompt_required / unsupported_model_for_completions"
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/responses",
+      "summary": "OpenAI 兼容：Responses API",
+      "description": "新版 Responses 形状：input 或 messages 均可，返回 output[].content[].text 与 input_tokens/output_tokens。stream:true 时下发 response.created / response.output_text.delta / response.completed 事件。",
+      "params": [
+        {
+          "name": "model",
+          "in": "body",
+          "type": "string",
+          "required": true,
+          "description": "同 chat/completions"
+        },
+        {
+          "name": "input",
+          "in": "body",
+          "type": "string",
+          "required": false,
+          "description": "字符串输入（与 messages 二选一）"
+        }
+      ],
+      "responseExample": {
+        "id": "resp_pty_01",
+        "object": "response",
+        "created_at": 1730000400,
+        "model": "pty-agent",
+        "status": "completed",
+        "output": [
+          {
+            "type": "message",
+            "id": "msg_01",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "配置语法正常。",
+                "annotations": []
+              }
+            ]
+          }
+        ],
+        "usage": {
+          "input_tokens": 312,
+          "output_tokens": 48,
+          "total_tokens": 360
+        }
+      },
+      "errors": [
+        {
+          "status": 400,
+          "error": "input_required"
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/embeddings",
+      "summary": "OpenAI 兼容：不支持",
+      "description": "PTY Agent 不提供向量能力，固定返回 501，让客户端优雅降级而不是静默失败。",
+      "params": [],
+      "responseExample": {
+        "error": {
+          "message": "/v1/embeddings 未实现：PTY Agent 不提供向量能力。",
+          "type": "invalid_request_error",
+          "param": null,
+          "code": "unsupported_endpoint"
+        }
+      },
+      "errors": [
+        {
+          "status": 501,
+          "error": "unsupported_endpoint"
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/_selftest",
+      "summary": "OpenAI 兼容：连通性自检",
+      "description": "一次返回鉴权、主机连通、真实执行、SSE 通道类型、上游 LLM 可达性（含 CORS 判定）五段结果，用来排查「客户端连不上」到底卡在哪一层。",
+      "params": [],
+      "responseExample": {
+        "ok": true,
+        "checks": {
+          "auth": "ok",
+          "host": {
+            "id": "office-pc",
+            "connected": true
+          },
+          "exec": {
+            "ok": true,
+            "ms": 42,
+            "sample": "Linux",
+            "blocked": false,
+            "risk": "safe"
+          },
+          "sse": {
+            "transport": "sse",
+            "framing": "data-prefixed",
+            "note": "中继已走 SSE 通道，事件实时下发"
+          },
+          "upstream": {
+            "configured": true,
+            "reachable": true,
+            "status": 200,
+            "cors": "ok",
+            "model": "deepseek-chat"
+          },
+          "config": {
+            "mode": "exec",
+            "readOnly": true,
+            "tools": 9,
+            "keySet": true
+          }
+        }
+      },
+      "errors": [
+        {
+          "status": 401,
+          "error": "missing_api_key"
+        }
+      ]
     }
   ],
   "websocket": {
@@ -1287,6 +1602,43 @@
       "面板可开启「只读模式」「写/执行前需页面确认」「允许 danger 级命令」等策略。"
     ]
   },
+  "openai": {
+    "baseUrl": "http://ai.pty2.<clientId>.html.dtns.top/v1",
+    "protocol": "openai-compatible",
+    "auth": "面板生成 openaiApiKey 后，请求需带 Authorization: Bearer <openaiApiKey>；端点默认关闭。",
+    "endpoints": [
+      "/v1/models",
+      "/v1/chat/completions",
+      "/v1/completions",
+      "/v1/responses",
+      "/v1/embeddings",
+      "/v1/_selftest"
+    ],
+    "models": {
+      "pty-exec": "把最后一条 user 消息当命令执行，不调用 LLM（最低延迟、完全确定性）",
+      "pty-exec@<hostId>": "同上，但指定目标主机",
+      "pty-agent": "调用上游 LLM 并注入 PTY 工具，在本层跑 agent 循环，客户端只看到普通对话",
+      "<上游模型名>": "原样透传上游 LLM（如 deepseek-chat / gpt-4o-mini）"
+    },
+    "streaming": "stream:true 时返回 SSE；若中继未走 SSE 通道（客户端未带 Accept: text/event-stream），整包缓冲后一次性返回，客户端解析方式不变。",
+    "extraFields": [
+      "pty",
+      "upstream"
+    ],
+    "errorEnvelope": "{ \"error\": { \"message\": \"...\", \"type\": \"invalid_request_error\", \"param\": null, \"code\": \"...\" } }",
+    "clientConfig": {
+      "baseUrl": "http://ai.pty2.<clientId>.html.dtns.top/v1",
+      "apiKey": "sk-pty-xxxxxxxx",
+      "model": "pty-exec"
+    },
+    "notes": [
+      "默认关闭，且默认只读（仅执行白名单内的安全命令）。",
+      "M3（pty-agent）需要配置上游 Base URL / API Key / 模型名；上游 Key 只存在本机浏览器。",
+      "pty 字段是附加信息（exitCode / durationMs / risk / termId / trace），标准客户端会忽略。",
+      "X-Pty-Session: <id> 可让多轮请求复用同一个 PTY，保留 cwd 与环境变量。",
+      "浏览器直连上游受 CORS 限制，可用 GET /v1/_selftest 的 upstream.cors 字段判定。"
+    ]
+  },
   "constants": {
     "maxReadLines": 5000,
     "defaultReadLines": 50,
@@ -1314,6 +1666,7 @@
   "related": {
     "demoPage": "demo-pty2-agent.html",
     "mcpGuide": "MCP-使用说明.md",
+    "openaiGuide": "OpenAI兼容接口-使用预览.md",
     "releaseNotes": "发布说明.md"
   }
 };
